@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+.npm-cache/
+.env
+*.tfstate*
+.terraform/
+*.tfvars
+!*.tfvars.example

@@ -1,0 +1,65 @@
+name: Deploy
+on:
+  workflow_run:
+    workflows: [CI]
+    branches: [main]
+    types: [completed]
+  workflow_dispatch:
+permissions: { contents: read, actions: read }
+concurrency: { group: billing-deploy, cancel-in-progress: false }
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: oficina-homolog-billing
+  NAMESPACE: oficina-fase4
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: "${{ github.event.workflow_run.head_sha || github.sha }}" }
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.workflow_run.head_sha }}-${{ github.run_number }}
+      - uses: azure/setup-helm@v4
+      - name: Configure deployment secrets
+        env:
+          DATABASE_SECRET_ID: ${{ vars.DATABASE_SECRET_ID }}
+          JWT_SECRET_ID: ${{ vars.JWT_SECRET_ID }}
+          BILLING_RUNTIME_SECRET_ID: ${{ vars.BILLING_RUNTIME_SECRET_ID }}
+        run: |
+          set -euo pipefail
+          aws eks update-kubeconfig --name oficina-homolog-eks
+          mkdir -p "$RUNNER_TEMP/billing-secrets"
+          aws secretsmanager get-secret-value --secret-id "$DATABASE_SECRET_ID" --query SecretString --output text | jq -r '.url' > "$RUNNER_TEMP/billing-secrets/DATABASE_URL"
+          aws secretsmanager get-secret-value --secret-id "$JWT_SECRET_ID" --query SecretString --output text | jq -r '.secret' > "$RUNNER_TEMP/billing-secrets/JWT_SECRET"
+          aws secretsmanager get-secret-value --secret-id "$BILLING_RUNTIME_SECRET_ID" --query SecretString --output text > "$RUNNER_TEMP/billing-runtime.json"
+          for key in AUTH_CLIENT_LOOKUP_TOKEN MP_ACCESS_TOKEN MP_WEBHOOK_SECRET; do jq -er ".$key" "$RUNNER_TEMP/billing-runtime.json" > "$RUNNER_TEMP/billing-secrets/$key"; done
+          printf '%s' '${{ secrets.AWS_ACCESS_KEY_ID }}' > "$RUNNER_TEMP/billing-secrets/AWS_ACCESS_KEY_ID"
+          printf '%s' '${{ secrets.AWS_SECRET_ACCESS_KEY }}' > "$RUNNER_TEMP/billing-secrets/AWS_SECRET_ACCESS_KEY"
+          printf '%s' '${{ secrets.AWS_SESSION_TOKEN }}' > "$RUNNER_TEMP/billing-secrets/AWS_SESSION_TOKEN"
+          for file in "$RUNNER_TEMP/billing-secrets/"*; do value="$(cat "$file")"; printf '%s' "$value" > "$file"; done
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create secret generic oficina-billing -n "$NAMESPACE" --from-file="$RUNNER_TEMP/billing-secrets" --dry-run=client -o yaml | kubectl apply -f -
+      - name: Deploy immutable image
+        run: |
+          helm upgrade --install oficina-billing ./helm/oficina-billing --namespace "$NAMESPACE" --atomic --wait --timeout 8m \
+            --set image.repository=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }} \
+            --set image.tag=${{ github.event.workflow_run.head_sha }}-${{ github.run_number }} \
+            --set config.INBOX_QUEUE_URL='${{ vars.BILLING_QUEUE_URL }}' --set config.OS_QUEUE_URL='${{ vars.OS_QUEUE_URL }}' \
+            --set config.MP_NOTIFICATION_URL='${{ vars.MP_NOTIFICATION_URL }}' --set config.MP_BACK_URL='${{ vars.MP_BACK_URL }}' \
+            --set config.DD_VERSION='${{ github.event.workflow_run.head_sha }}'
+          kubectl rollout status deployment/oficina-billing -n "$NAMESPACE" --timeout=5m
+      - if: always()
+        run: rm -rf "$RUNNER_TEMP/billing-secrets" "$RUNNER_TEMP/billing-runtime.json"

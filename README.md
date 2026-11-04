@@ -1,0 +1,103 @@
+# Oficina Billing Service — Fase 4
+
+Microsserviço NestJS independente para orçamento, decisão do cliente e cobrança **após o reparo** usando Mercado Pago Checkout Pro Preferences. Possui PostgreSQL exclusivo, Dockerfile, Helm, infraestrutura Terraform e CI/CD próprios. Nenhum acesso ao banco de outro serviço.
+
+## Execução
+
+Node.js 22, npm e Docker. Copie `.env.example` para `.env`, preencha os segredos locais e execute:
+
+```sh
+docker compose up -d db
+npm ci
+npm run build
+npm start
+```
+
+Carregue `.env` no processo ao executar diretamente (`node --env-file=.env --require dd-trace/init dist/main.js`); Compose já a injeta. O bootstrap aplica tabelas idempotentes; `npm run migrate` permite aplicá-las separadamente. API porta 3001; Swagger `/api/docs`; JSON `/api/docs-json`; health público `/api/v1/billing/health`; liveness `/api/health/live`; readiness `/api/health/ready` consulta o banco.
+
+## Contratos e autorização
+
+Prefixo `/api/v1/billing`. Respostas JSON diretas. JWT HS256 exige issuer `oficina-auth-serverless`, audience `oficina-api`, assinatura e validade. Clientes acessam apenas `client_id`/`clienteId`/`sub` correspondente à OS. Somente o cliente titular aprova/rejeita. Mecânico gera orçamento apenas se atribuído à OS; administrador/consultor possuem acesso operacional. Filial presente no token deve corresponder à OS.
+
+| Método e caminho | Uso |
+|---|---|
+| `POST /internal/orders` | Registrar snapshot `{osId,filialId,clienteId,mecanicoId?}`; idempotente e sem reset |
+| `GET /internal/orders/:osId` | Snapshot interno completo |
+| `GET /orders/:osId` | Snapshot autenticado, orçamento e pagamento |
+| `PUT /orders/:osId/budget` | `{items:[{description,quantity,unitPriceCents,pecaId?}]}` |
+| `POST /orders/:osId/approve` ou `/reject` | Decisão do cliente |
+| `POST /orders/:osId/checkout` | Obter/criar checkout somente após `CreatePayment` |
+| `GET /orders/:osId/payment` | Estado financeiro |
+| `POST /webhooks/mercadopago?data.id=...` | Assinatura HMAC Mercado Pago obrigatória |
+
+Endpoints internos exigem `X-Internal-Token` igual a `AUTH_CLIENT_LOOKUP_TOKEN`. O corpo é limitado aos campos permitidos; não é possível injetar orçamento aprovado ou reparo concluído na criação. Dinheiro usa inteiros em centavos; quantidade inteira positiva. IDs UUID são aceitos e preservados.
+
+```mermaid
+flowchart LR
+  OS[OS Service / orquestrador] -->|comandos SQS| B[Billing NestJS]
+  OS -->|REST interno: registro e consulta| B
+  B --> DB[(PostgreSQL exclusivo)]
+  B -->|outbox SQS| OS
+  B -->|Preferences / Payments API| MP[Mercado Pago]
+  MP -->|webhook HMAC| B
+  B --> DD[Datadog APM e logs JSON]
+```
+
+Envelope SQS: `{messageId,type,version:1,sagaId,osId,filialId,correlationId,occurredAt,traceparent?,payload}`. Fila própria `INBOX_QUEUE_URL`; eventos destinados a `OS_QUEUE_URL`.
+
+| Comando | Comportamento / evento |
+|---|---|
+| `AssignMechanic {mecanicoId}` | Atualiza atribuição confiável, `MechanicLinked` |
+| `PrepareApprovedBudget {}` | Congela versão aprovada e vincula Saga, `BudgetPrepared {budget}` |
+| `ReleaseBudgetPreparation {}` | Descongela sem apagar aprovação, `BudgetReleased` |
+| `CreatePayment {}` | Confirma reparo concluído, inicia cobrança, `PaymentPending` e `PaymentCreated {checkoutUrl,preferenceId}` |
+
+Erros de negócio geram `CommandFailed {commandType,reason}`; mensagens inválidas ou falhas transitórias não são removidas e seguem retry/DLQ. Rotas públicas emitem `BudgetGenerated {budget}`, `BudgetApproved {budget}` e `BudgetRejected {budget}`. Pagamento verificado emite `PaymentConfirmed {amountCents,paymentId}` com contexto original da cobrança persistido.
+
+## Saga e consistência
+
+Escolha: **Saga orquestrada pelo OS Service**. Billing é participante: prepara orçamento, libera preparação na compensação e registra cobrança depois da conclusão física. O orçamento pertence a este serviço porque aprovação, preço e pagamento exigem consistência local e auditoria financeira. PostgreSQL permite transação única para documento, inbox e outbox.
+
+`billing_orders` guarda snapshots/versionamento financeiro. Cada alteração usa `SELECT ... FOR UPDATE`; a transação grava estado e eventos em `billing_outbox`. `billing_inbox` deduplica por `messageId` na mesma transação. Publicador usa `FOR UPDATE SKIP LOCKED`, marca entrega apenas após ACK do SQS e repete falhas a cada 10 segundos. Consumo é at least once, com fila de quarentena após cinco recebimentos. Consumidores do OS devem deduplicar eventos. Saga liberada fica registrada e comandos atrasados não a reabrem. Reparo concluído impede compensação financeira automática que apagaria o trabalho realizado.
+
+O serviço não desfaz reparo físico nem restitui peças consumidas. Rejeição de pagamento mantém `AWAITING_PAYMENT`, com preferência existente para nova tentativa do cliente. Somente pagamento `approved`, de referência/valor/moeda corretos, muda Billing para `PAID`; OS libera entrega ao consumir `PaymentConfirmed`. Não há endpoint para simular confirmação em produção.
+
+## Mercado Pago
+
+Configure `MP_ACCESS_TOKEN`, `MP_WEBHOOK_SECRET`, `MP_NOTIFICATION_URL`, `MP_BACK_URL` e `MP_SANDBOX=true` para credenciais/contas de teste. Cadastre o webhook do tipo `payment` no painel Mercado Pago. `MP_API_BASE_URL` padrão é a API oficial; HTTP é aceito apenas em `NODE_ENV=test/development` para localhost ou `mercadopago-stub`.
+
+A tentativa e chave idempotente são persistidas **antes** do POST da preferência, que é feito uma única vez. Timeout/erro de resultado desconhecido muda para `UNKNOWN`. A cada 15 ciclos o reconciliador busca preferência e pagamentos por `external_reference=osId:budgetVersion`; ele nunca repete automaticamente o POST. Ausência de resultado mantém o estado pendente para reconciliação/intervenção, evitando duplicidade. Não se presume que Preferences ofereça garantia suficiente de idempotência apenas pelo header.
+
+Webhook verifica `x-signature` HMAC-SHA256, `x-request-id`, `data.id` e tolerância de cinco minutos. Em seguida consulta `GET /v1/payments/:id`; não confia no corpo, redirect ou status informado pelo cliente. Duplicatas não repetem confirmação. Reembolsos/disputas após reparo exigem tratamento operacional e não reabrem automaticamente uma OS entregue.
+
+Documentação oficial: [Checkout Pro Preferences](https://www.mercadopago.com.br/developers/en/reference/online-payments/checkout-pro-preferences/overview), [busca de preferências por referência](https://www.mercadopago.com.br/developers/en/reference/online-payments/checkout-pro-preferences/search-preferences/get), [assinatura de notificações](https://www.mercadopago.com.br/developers/en/docs/checkout-pro-preferences/additional-settings/optional-notifications).
+
+## Testes e qualidade
+
+```sh
+npm run lint
+npm run test:cov
+npm run build
+# PostgreSQL real obrigatório para integração:
+TEST_DATABASE_URL=postgresql://billing:billing@localhost:5433/oficina_billing npm run test:integration
+```
+
+Threshold de 80% em statements, branches, funções e linhas para **todo código de negócio, HTTP, autenticação, persistência e worker**; somente bootstrap/wiring são excluídos. Testes de domínio, autorização/ownership, webhook HMAC, adaptação Mercado Pago, compensação, duplicatas e HTTP NestJS. Integração com PostgreSQL real verifica rollback total de estado/inbox/outbox, concorrência de duplicatas e recuperação do publicador. SQL em memória nos unitários não substitui essa validação real.
+
+CI publica o artefato `billing-coverage`, executa integração PostgreSQL, lint/tipos, build, container, Helm e Terraform validate. O check Sonar aguarda quality gate e **falha** se faltarem token/projeto/organização. Links e evidências da execução GitHub Actions devem ser adicionados após o primeiro push: a cobertura local não comprova o estado remoto.
+
+[Evidência local de build, cobertura, PostgreSQL real, Helm e Terraform](docs/evidence/validation.md).
+
+## AWS, infraestrutura e deploy
+
+`infra/` provisiona RDS PostgreSQL 16 exclusivo, privado e criptografado, subnet group, SG permitindo 5432 apenas dos nós EKS, credencial aleatória em Secrets Manager, SQS/DLQ e ECR próprios. Inputs: `vpc_id`, `private_subnet_ids`, `eks_node_security_group_id`, `environment`, `aws_region`. Inicialize o backend S3 com chave exclusiva e criptografia; o state contém a credencial e requer controle de acesso. Não execute apply sem revisar o plano/custo.
+
+Workflow `Infrastructure` valida/planeja e aplica automaticamente mudanças de `infra/` publicadas na `main`; execução manual permite somente plano por padrão. Configure `TF_STATE_BUCKET`, `VPC_ID`, `PRIVATE_SUBNET_IDS_JSON` e `EKS_NODE_SECURITY_GROUP_ID`. No primeiro provisionamento, execute infraestrutura antes de preencher URLs/secrets do deploy da aplicação.
+
+Secrets GitHub: credenciais temporárias `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `SONAR_TOKEN`. Variables: `DATABASE_SECRET_ID` (JSON `{url}`), `JWT_SECRET_ID` (`{secret}`), `BILLING_RUNTIME_SECRET_ID` (`{AUTH_CLIENT_LOOKUP_TOKEN,MP_ACCESS_TOKEN,MP_WEBHOOK_SECRET}`), `BILLING_QUEUE_URL`, `OS_QUEUE_URL`, `MP_NOTIFICATION_URL`, `MP_BACK_URL`, `SONAR_PROJECT_KEY`, `SONAR_ORGANIZATION`. AWS Academy usa LabRole existente; renovar as credenciais nos secrets de runtime a cada sessão.
+
+Deploy independente ocorre somente após CI bem-sucedido da `main`, publica imagem imutável e aplica Helm com `--atomic --wait` no namespace **oficina-fase4**. Não substitui release legado. Service interno `oficina-billing:3001`; configurar roteamento público no gateway para as rotas Billing e webhook. Certificado CA RDS oficial incluído na imagem, validação TLS habilitada no Helm. Probes, recursos, duas réplicas, PDB e tags Datadog incluídos.
+
+Datadog inicia antes do Nest, propaga `traceparent` em comandos/eventos e gera spans de processamento SQS. Logs JSON incluem correlação/Saga e IDs de trace quando ativos; não registram token, CPF, connection string ou credenciais Mercado Pago.
+
+Aplicar proteção remota de `main`: PR obrigatório, uma aprovação, checks `Quality`, `Integration`, `Container`, `Sonar`. `.github/settings.yml` documenta as regras; sua presença não aplica nem comprova proteção no GitHub.

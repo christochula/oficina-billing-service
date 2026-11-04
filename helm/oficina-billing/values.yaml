@@ -1,0 +1,29 @@
+replicas: 2
+image:
+  repository: oficina-billing-service
+  tag: local
+secretName: oficina-billing
+service:
+  type: ClusterIP
+config:
+  DATABASE_SSL: "true"
+  AWS_REGION: us-east-1
+  INBOX_QUEUE_URL: ""
+  OS_QUEUE_URL: ""
+  MP_SANDBOX: "true"
+  MP_NOTIFICATION_URL: ""
+  MP_BACK_URL: ""
+  DD_SERVICE: oficina-billing-service
+  DD_ENV: homolog
+  DD_TRACE_ENABLED: "true"
+  DD_LOGS_INJECTION: "true"
+  DD_VERSION: "4.0.0"
+  JWT_ISSUER: oficina-auth-serverless
+  JWT_AUDIENCE: oficina-api
+resources:
+  requests:
+    cpu: 100m
+    memory: 192Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi

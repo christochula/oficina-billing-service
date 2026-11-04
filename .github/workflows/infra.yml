@@ -1,0 +1,33 @@
+name: Infrastructure
+on:
+  push:
+    branches: [main]
+    paths: ["infra/**", ".github/workflows/infra.yml"]
+  workflow_dispatch:
+    inputs:
+      apply:
+        description: Aplicar o plano na AWS
+        type: boolean
+        default: false
+permissions: { contents: read }
+concurrency: { group: billing-infrastructure, cancel-in-progress: false }
+jobs:
+  infrastructure:
+    runs-on: ubuntu-latest
+    env:
+      TF_VAR_vpc_id: ${{ vars.VPC_ID }}
+      TF_VAR_private_subnet_ids: ${{ vars.PRIVATE_SUBNET_IDS_JSON }}
+      TF_VAR_eks_node_security_group_id: ${{ vars.EKS_NODE_SECURITY_GROUP_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: us-east-1
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform -chdir=infra init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="key=oficina-fase4/billing/terraform.tfstate" -backend-config="region=us-east-1" -backend-config="encrypt=true"
+      - run: terraform -chdir=infra validate && terraform -chdir=infra plan -out=tfplan
+      - if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.apply)
+        run: terraform -chdir=infra apply -auto-approve tfplan

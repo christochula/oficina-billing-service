@@ -1,0 +1,6 @@
+apiVersion: v2
+name: oficina-billing
+description: Billing Service independente
+type: application
+version: 4.0.0
+appVersion: "4.0.0"
