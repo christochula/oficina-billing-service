@@ -16,7 +16,7 @@ export class MercadoPago implements PaymentProvider {
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (!this.env.MP_ACCESS_TOKEN) throw new Error('MP_ACCESS_TOKEN nao configurado');
     const base = this.env.MP_API_BASE_URL ?? 'https://api.mercadopago.com';
-    if (!base.startsWith('https://') && !(['test', 'development'].includes(this.env.NODE_ENV ?? '') && /^http:\/\/(localhost|127\.0\.0\.1|mercadopago-stub)(:\d+)?$/.test(base))) throw new Error('MP_API_BASE_URL insegura');
+    if (!base.startsWith('https://') && !(['test', 'development'].includes(this.env.NODE_ENV ?? '') && /^http:\/\/(localhost|127\.0\.0\.1|mercadopago|mercadopago-stub)(:\d+)?$/.test(base))) throw new Error('MP_API_BASE_URL insegura');
     const response = await this.http(`${base}${path}`, { ...init, signal: AbortSignal.timeout(10000), headers: { Authorization: `Bearer ${this.env.MP_ACCESS_TOKEN}`, 'Content-Type': 'application/json', ...init.headers } });
     if (!response.ok) throw new Error(`Mercado Pago HTTP ${response.status}`);
     return await response.json() as T;

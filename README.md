@@ -98,6 +98,6 @@ Secrets GitHub: credenciais temporárias `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS
 
 Deploy independente ocorre somente após CI bem-sucedido da `main`, publica imagem imutável e aplica Helm com `--atomic --wait` no namespace **oficina-fase4**. Não substitui release legado. Service interno `oficina-billing:3001`; configurar roteamento público no gateway para as rotas Billing e webhook. Certificado CA RDS oficial incluído na imagem, validação TLS habilitada no Helm. Probes, recursos, duas réplicas, PDB e tags Datadog incluídos.
 
-Datadog inicia antes do Nest, propaga `traceparent` em comandos/eventos e gera spans de processamento SQS. Logs JSON incluem correlação/Saga e IDs de trace quando ativos; não registram token, CPF, connection string ou credenciais Mercado Pago.
+Datadog inicia antes do Nest, propaga `traceparent` em comandos/eventos e gera spans de processamento SQS. Com `DD_METRICS_ENABLED=true`, emite distribuição DogStatsD `oficina.api.request.duration_ms` em milissegundos com tags `method`, `status_code`, `service`, `env`, `version`. Falhas de telemetria não interrompem requests. Logs JSON incluem correlação/Saga e IDs de trace quando ativos; não registram token, CPF, connection string ou credenciais Mercado Pago.
 
 Aplicar proteção remota de `main`: PR obrigatório, uma aprovação, checks `Quality`, `Integration`, `Container`, `Sonar`. `.github/settings.yml` documenta as regras; sua presença não aplica nem comprova proteção no GitHub.

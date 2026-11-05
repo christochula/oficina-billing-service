@@ -55,6 +55,7 @@ export class BillingService {
             delete order.preparedSagaId; emit('BudgetReleased'); break;
           case 'CreatePayment':
             requireApproved(order); order.repairCompleted = true;
+            order.paymentContext ??= ctx;
             if (order.status !== 'PAID') order.status = 'AWAITING_PAYMENT';
             emit('PaymentPending', { amountCents: order.budget!.totalCents }); break;
           default: throw new BadRequestException('Comando nao suportado');
@@ -68,23 +69,25 @@ export class BillingService {
   }
   async checkout(osId: string, ctx: Context, claims?: Claims): Promise<Order> {
     let create: { order: Order; payment: Payment } | undefined;
+    let paymentContext = ctx;
     await this.store.change(osId, ctx, ({ order }) => {
       if (claims) authorize(order, claims, 'checkout');
       const budget = requireApproved(order);
       if (!order.repairCompleted) throw new ConflictException('Pagamento disponivel somente apos reparo');
       if (order.payment) return;
-      order.payment = { status: 'CREATING', key: randomUUID(), externalReference: `${order.osId}:${budget.version}`, amountCents: budget.totalCents, ...ctx };
+      paymentContext = order.paymentContext ?? { ...ctx, sagaId: order.preparedSagaId ?? ctx.sagaId };
+      order.payment = { status: 'CREATING', key: randomUUID(), externalReference: `${order.osId}:${budget.version}`, amountCents: budget.totalCents, ...paymentContext };
       create = { order: structuredClone(order), payment: structuredClone(order.payment) };
     });
     if (create) {
-      try { const preference = await this.provider.create(create.order, create.payment); await this.savePreference(osId, ctx, preference); }
-      catch { await this.store.change(osId, ctx, ({ order, emit }) => { if (order.payment!.status === 'CREATING') order.payment!.status = 'UNKNOWN'; emit('PaymentPending', { reason: 'PROVIDER_RESULT_UNKNOWN', amountCents: order.payment!.amountCents }); }); }
+      try { const preference = await this.provider.create(create.order, create.payment); await this.savePreference(osId, paymentContext, preference); }
+      catch { await this.store.change(osId, paymentContext, ({ order, emit }) => { if (order.payment!.status === 'CREATING') order.payment!.status = 'UNKNOWN'; emit('PaymentPending', { reason: 'PROVIDER_RESULT_UNKNOWN', amountCents: order.payment!.amountCents }); }); }
     }
     return this.store.get(osId);
   }
   private async savePreference(osId: string, ctx: Context, preference: Preference): Promise<void> {
     const url = this.sandbox ? preference.sandbox_init_point ?? preference.init_point : preference.init_point;
-    if (!preference.id || (!url?.startsWith('https://') && !(['test', 'development'].includes(process.env.NODE_ENV ?? '') && /^http:\/\/(localhost|127\.0\.0\.1|mercadopago-stub)(:\d+)?\//.test(url ?? '')))) throw new Error('Preferencia invalida');
+    if (!preference.id || (!url?.startsWith('https://') && !(['test', 'development'].includes(process.env.NODE_ENV ?? '') && /^http:\/\/(localhost|127\.0\.0\.1|mercadopago|mercadopago-stub)(:\d+)?\//.test(url ?? '')))) throw new Error('Preferencia invalida');
     await this.store.change(osId, ctx, ({ order, emit }) => {
       order.payment!.preferenceId = preference.id; order.payment!.checkoutUrl = url;
       if (order.payment!.status !== 'APPROVED') order.payment!.status = 'PENDING';

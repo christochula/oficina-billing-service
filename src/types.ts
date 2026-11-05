@@ -13,7 +13,7 @@ export interface Payment {
 export interface Order {
   osId: string; filialId: string; clienteId: string; mecanicoId?: string;
   status: 'AWAITING_BUDGET' | 'AWAITING_APPROVAL' | 'APPROVED' | 'REJECTED' | 'AWAITING_PAYMENT' | 'PAID';
-  budget?: Budget; preparedSagaId?: string; releasedSagaIds?: string[]; repairCompleted?: boolean; payment?: Payment;
+  budget?: Budget; preparedSagaId?: string; releasedSagaIds?: string[]; repairCompleted?: boolean; payment?: Payment; paymentContext?: Context;
 }
 export interface Context { sagaId: string; correlationId: string; traceparent?: string }
 export type Claims = { sub: string; role?: string; papel?: string; token_use?: string; client_id?: string; clienteId?: string; filialId?: string };

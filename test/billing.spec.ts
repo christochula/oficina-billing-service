@@ -75,6 +75,15 @@ describe('Billing business behavior', () => {
     provider.findPreference.mockRejectedValueOnce(new Error('offline')); await service.reconcile();
     expect((await service.get('os-1')).payment?.status).toBe('UNKNOWN');
   });
+  it('preserves command saga when customer checkout wins race before automatic checkout', async () => {
+    await approved();
+    await store.change('os-1', context, ({ order }) => { order.repairCompleted = true; order.paymentContext = context; });
+    await service.checkout('os-1', { sagaId: 'human-request', correlationId: 'human-correlation' }, client);
+    expect((await service.get('os-1')).payment?.sagaId).toBe(context.sagaId);
+    expect(store.events.find(event => event.type === 'PaymentCreated')?.sagaId).toBe(context.sagaId);
+    provider.getPayment.mockResolvedValue({ id: 123, status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50 });
+    await service.webhook('123'); expect(store.events.at(-1)?.sagaId).toBe(context.sagaId);
+  });
   it('validates authoritative payment, deduplicates approval and does not undo payment', async () => {
     await approved(); await service.command(message('CreatePayment'));
     const payment = { id: 123, status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50 };
