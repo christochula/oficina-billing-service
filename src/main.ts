@@ -10,11 +10,13 @@ import { randomUUID } from 'node:crypto';
 import { Request, Response, NextFunction } from 'express';
 import tracer from 'dd-trace';
 import { RequestMetrics } from './metrics';
+import { traceContextMiddleware } from './trace-context';
 
 async function bootstrap(): Promise<void> {
   if (!process.env.JWT_SECRET || !process.env.AUTH_CLIENT_LOOKUP_TOKEN) throw new Error('Segredos JWT e token interno obrigatorios');
   const app = await NestFactory.create(AppModule);
   const metrics = new RequestMetrics();
+  app.use(traceContextMiddleware());
   app.use((req: Request, res: Response, next: NextFunction) => {
     const started = performance.now();
     const supplied = req.headers['x-correlation-id'];

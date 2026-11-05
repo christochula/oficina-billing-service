@@ -7,6 +7,7 @@ import { createHmac } from 'node:crypto';
 import { BillingController, InternalController, HealthController, WebhookController, BillingHealthController } from '../src/controller';
 import { BillingService } from '../src/billing';
 import { MemoryStore, orderInput, items } from './helpers';
+import { traceContextMiddleware } from '../src/trace-context';
 
 describe('HTTP boundary integration', () => {
   let app: INestApplication; let billing: BillingService;
@@ -16,7 +17,12 @@ describe('HTTP boundary integration', () => {
     process.env.JWT_SECRET = 'secret'; process.env.AUTH_CLIENT_LOOKUP_TOKEN = 'internal'; process.env.MP_WEBHOOK_SECRET = 'webhook';
     billing = new BillingService(new MemoryStore(), provider);
     const module = await Test.createTestingModule({ controllers: [BillingController, InternalController, HealthController, WebhookController, BillingHealthController], providers: [{ provide: BillingService, useValue: billing }] }).compile();
-    app = module.createNestApplication(); await app.init();
+    app = module.createNestApplication();
+    app.use(traceContextMiddleware({
+      scope: () => ({ active: () => ({ context: () => ({}) }) }),
+      inject: (_context: unknown, _format: unknown, carrier: Record<string, string>) => { carrier.traceparent = '00-1234567890abcdef1234567890abcdef-1234567890abcdef-01'; },
+    } as never));
+    await app.init();
   });
   afterEach(async () => { await app.close(); });
   it('requires internal token and JWT, exposes idempotent internal snapshot', async () => {
@@ -43,5 +49,13 @@ describe('HTTP boundary integration', () => {
     const stamp = String(Math.floor(Date.now() / 1000)); const sig = createHmac('sha256', 'webhook').update(`id:123;request-id:req;ts:${stamp};`).digest('hex');
     const spy = jest.spyOn(billing, 'webhook').mockResolvedValue();
     await request(app.getHttpServer()).post('/api/v1/billing/webhooks/mercadopago?data.id=123').set('x-request-id', 'req').set('x-signature', `ts=${stamp},v1=${sig}`).expect(201); expect(spy).toHaveBeenCalledWith('123');
+  });
+  it('persists W3C context in the generated event for browser requests without headers', async () => {
+    await billing.create(orderInput);
+    await request(app.getHttpServer()).put('/api/v1/billing/orders/os-1/budget')
+      .set('Authorization', `Bearer ${jwt('mechanic-1', 'MECANICO')}`).send({ items }).expect(200);
+    const store = billing.store as MemoryStore;
+    expect(store.events.find(event => event.type === 'BudgetGenerated')?.traceparent)
+      .toBe('00-1234567890abcdef1234567890abcdef-1234567890abcdef-01');
   });
 });
