@@ -11,7 +11,42 @@ describe('Mercado Pago HTTP adapter', () => {
     await new MercadoPago(env, http).create(order, payment);
     const [url, request] = http.mock.calls[0]; expect(url).toContain('/checkout/preferences');
     expect(JSON.parse(request.body)).toMatchObject({ external_reference: 'os-1:1', items: [{ unit_price: 50, quantity: 1, currency_id: 'BRL' }] });
+    expect(JSON.parse(request.body)).toMatchObject({
+      back_urls: { success: 'https://app.example/#/ordens/os-1', pending: 'https://app.example/#/ordens/os-1', failure: 'https://app.example/#/ordens/os-1' },
+      auto_return: 'approved',
+    });
     expect(request.headers['X-Idempotency-Key']).toBe('key');
+  });
+  it('keeps the portal origin, deployment path and query while encoding the OS fragment safely', async () => {
+    const http = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 'p', init_point: 'https://www.mercadopago.com.br/checkout/start?pref_id=p' }) });
+    await new MercadoPago({ ...env, MP_BACK_URL: 'https://gateway.example/homolog/?source=checkout#/old', MP_ACCESS_TOKEN: 'APP_USR-fixture-not-a-real-token' }, http)
+      .create({ ...order, osId: 'os /?#<>' }, payment);
+    const body = JSON.parse(http.mock.calls[0][1].body);
+    expect(body.back_urls.success).toBe('https://gateway.example/homolog/?source=checkout#/ordens/os%20%2F%3F%23%3C%3E');
+    expect(http.mock.calls[0][1].headers.Authorization).toBe('Bearer APP_USR-fixture-not-a-real-token');
+  });
+  it('supports the local simulator without enabling auto_return for HTTP', async () => {
+    const http = jest.fn().mockResolvedValue({ ok: true, json: async () => ({ id: 'p', init_point: 'http://localhost:8088/checkout/p' }) });
+    await new MercadoPago({ ...env, NODE_ENV: 'development', MP_NOTIFICATION_URL: 'http://billing:3001/api/v1/billing/webhooks/mercadopago', MP_BACK_URL: 'http://localhost:5173/#/ordens' }, http).create(order, payment);
+    const body = JSON.parse(http.mock.calls[0][1].body);
+    expect(body.notification_url).toBe('http://billing:3001/api/v1/billing/webhooks/mercadopago');
+    expect(body.back_urls.success).toBe('http://localhost:5173/#/ordens/os-1');
+    expect(body).not.toHaveProperty('auto_return');
+  });
+  it.each([
+    { MP_BACK_URL: 'not-a-url' },
+    { MP_BACK_URL: 'javascript:alert(1)' },
+    { MP_BACK_URL: 'http://portal.example/' },
+    { MP_BACK_URL: 'https://user:password@portal.example/' },
+    { MP_BACK_URL: 'https://localhost:5173/' },
+    { MP_BACK_URL: 'https://portal.localhost/' },
+    { MP_NOTIFICATION_URL: 'http://billing:3001/hook' },
+    { MP_NOTIFICATION_URL: 'https://127.0.0.1/hook' },
+    { MP_BACK_URL: 'http://external.example/', NODE_ENV: 'test' },
+  ])('rejects unsafe return/webhook configuration before creating a preference: %j', async override => {
+    const http = jest.fn();
+    await expect(new MercadoPago({ ...env, ...override }, http).create(order, payment)).rejects.toThrow(/MP_BACK_URL|MP_NOTIFICATION_URL/);
+    expect(http).not.toHaveBeenCalled();
   });
   it('handles search and authoritative lookup, refuses ambiguous preferences', async () => {
     const http = jest.fn(); const adapter = new MercadoPago(env, http);

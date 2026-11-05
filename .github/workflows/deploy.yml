@@ -32,7 +32,7 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.workflow_run.head_sha }}-${{ github.run_number }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.workflow_run.head_sha }}-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: azure/setup-helm@v4
       - name: Configure deployment secrets
         env:
@@ -57,7 +57,7 @@ jobs:
         run: |
           helm upgrade --install oficina-billing ./helm/oficina-billing --namespace "$NAMESPACE" --atomic --wait --timeout 8m \
             --set image.repository=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }} \
-            --set image.tag=${{ github.event.workflow_run.head_sha }}-${{ github.run_number }} \
+            --set image.tag=${{ github.event.workflow_run.head_sha }}-${{ github.run_id }}-${{ github.run_attempt }} \
             --set config.INBOX_QUEUE_URL='${{ vars.BILLING_QUEUE_URL }}' --set config.OS_QUEUE_URL='${{ vars.OS_QUEUE_URL }}' \
             --set config.MP_NOTIFICATION_URL='${{ vars.MP_NOTIFICATION_URL }}' --set config.MP_BACK_URL='${{ vars.MP_BACK_URL }}' \
             --set config.DD_VERSION='${{ github.event.workflow_run.head_sha }}'

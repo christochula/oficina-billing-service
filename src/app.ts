@@ -10,5 +10,5 @@ export function makeStore(): PostgresStore {
   if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL obrigatoria');
   return new PostgresStore(new Pool({ connectionString: process.env.DATABASE_URL, ssl: process.env.DATABASE_SSL === 'true' ? { rejectUnauthorized: true, ca: readFileSync(process.env.DATABASE_SSL_CA_FILE ?? '/app/certs/rds-ca.pem', 'utf8') } : false, max: 10 }));
 }
-@Module({ controllers: [BillingController, InternalController, WebhookController, HealthController, BillingHealthController], providers: [{ provide: BillingService, useFactory: () => new BillingService(makeStore(), new MercadoPago(), process.env.MP_SANDBOX !== 'false') }] })
+@Module({ controllers: [BillingController, InternalController, WebhookController, HealthController, BillingHealthController], providers: [{ provide: BillingService, useFactory: () => new BillingService(makeStore(), new MercadoPago()) }] })
 export class AppModule {}

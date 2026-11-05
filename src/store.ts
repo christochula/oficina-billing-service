@@ -54,7 +54,7 @@ export class PostgresStore implements BillingStore {
     finally { client.release(); }
   }
   async pendingPayments(): Promise<Order[]> {
-    const result = await this.pool.query("SELECT data FROM billing_orders WHERE data->'payment'->>'status' IN ('CREATING','UNKNOWN','PENDING') LIMIT 50");
+    const result = await this.pool.query("SELECT data FROM billing_orders WHERE data->'payment'->>'status' IN ('CREATING','UNKNOWN','PENDING','REJECTED') LIMIT 50");
     return result.rows.map(row => row.data as Order);
   }
   async deliverOutbox(send: (body: Envelope) => Promise<void>): Promise<void> {
