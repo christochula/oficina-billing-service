@@ -1,0 +1,5 @@
+bucket = "preencher-bucket-terraform"
+key = "oficina-fase4/billing/terraform.tfstate"
+region = "us-east-1"
+encrypt = true
+use_lockfile = true

@@ -13,6 +13,7 @@ permissions: { contents: read }
 concurrency: { group: billing-infrastructure, cancel-in-progress: false }
 jobs:
   infrastructure:
+    environment: homolog
     runs-on: ubuntu-latest
     env:
       TF_VAR_vpc_id: ${{ vars.VPC_ID }}

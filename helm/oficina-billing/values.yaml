@@ -4,7 +4,7 @@ image:
   tag: local
 secretName: oficina-billing
 service:
-  type: ClusterIP
+  type: LoadBalancer
 config:
   DATABASE_SSL: "true"
   AWS_REGION: us-east-1
