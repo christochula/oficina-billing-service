@@ -10,7 +10,7 @@ config:
   AWS_REGION: us-east-1
   INBOX_QUEUE_URL: ""
   OS_QUEUE_URL: ""
-  MP_SANDBOX: "true"
+  MP_API_BASE_URL: "https://api.mercadopago.com"
   MP_NOTIFICATION_URL: ""
   MP_BACK_URL: ""
   DD_SERVICE: oficina-billing-service

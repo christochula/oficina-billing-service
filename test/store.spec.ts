@@ -27,6 +27,10 @@ describe('Postgres store SQL persistence', () => {
     expect(await store.pendingPayments()).toHaveLength(0);
     await store.change('os-1', context, ({ order }) => { order.payment = { status: 'UNKNOWN', key: 'k', externalReference: 'r', amountCents: 1 }; });
     expect(await store.pendingPayments()).toHaveLength(1);
+    await store.change('os-1', context, ({ order }) => { order.payment!.status = 'REJECTED'; });
+    expect(await store.pendingPayments()).toHaveLength(1);
+    await store.change('os-1', context, ({ order }) => { order.payment!.status = 'APPROVED'; });
+    expect(await store.pendingPayments()).toHaveLength(0);
   });
 });
 

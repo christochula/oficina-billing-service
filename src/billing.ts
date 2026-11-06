@@ -5,7 +5,7 @@ import { PaymentProvider, Preference, ProviderPayment } from './mercadopago';
 import { BillingStore, Claims, Context, Envelope, Order, Payment } from './types';
 
 export class BillingService {
-  constructor(readonly store: BillingStore, readonly provider: PaymentProvider, readonly sandbox = true) {}
+  constructor(readonly store: BillingStore, readonly provider: PaymentProvider) {}
   async create(input: { osId: string; filialId: string; clienteId: string; mecanicoId?: string }): Promise<Order> {
     if (!input || !['osId', 'filialId', 'clienteId'].every(key => typeof (input as Record<string, unknown>)[key] === 'string' && String((input as Record<string, unknown>)[key]).length > 0)) throw new BadRequestException('Identificadores obrigatorios');
     return this.store.create({ osId: input.osId, filialId: input.filialId, clienteId: input.clienteId, ...(input.mecanicoId ? { mecanicoId: input.mecanicoId } : {}), status: 'AWAITING_BUDGET' });
@@ -86,7 +86,7 @@ export class BillingService {
     return this.store.get(osId);
   }
   private async savePreference(osId: string, ctx: Context, preference: Preference): Promise<void> {
-    const url = this.sandbox ? preference.sandbox_init_point ?? preference.init_point : preference.init_point;
+    const url = preference.init_point;
     if (!preference.id || (!url?.startsWith('https://') && !(['test', 'development'].includes(process.env.NODE_ENV ?? '') && /^http:\/\/(localhost|127\.0\.0\.1|mercadopago|mercadopago-stub)(:\d+)?\//.test(url ?? '')))) throw new Error('Preferencia invalida');
     await this.store.change(osId, ctx, ({ order, emit }) => {
       order.payment!.preferenceId = preference.id; order.payment!.checkoutUrl = url;
@@ -116,7 +116,7 @@ export class BillingService {
   async reconcile(): Promise<void> {
     for (const order of await this.store.pendingPayments()) {
       try {
-        const ctx = { sagaId: order.osId, correlationId: `reconcile-${order.osId}` };
+        const ctx: Context = { sagaId: order.payment!.sagaId ?? order.paymentContext?.sagaId ?? order.osId, correlationId: order.payment!.correlationId ?? `reconcile-${order.osId}`, ...(order.payment!.traceparent ? { traceparent: order.payment!.traceparent } : {}) };
         if (!order.payment!.preferenceId) {
           const preference = await this.provider.findPreference(order.payment!.externalReference);
           if (preference) await this.savePreference(order.osId, ctx, preference);

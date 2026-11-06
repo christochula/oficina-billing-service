@@ -1,10 +1,26 @@
 name: Deploy
+run-name: Billing ${{ (inputs.bootstrap || startsWith(github.ref, 'refs/tags/phase4/billing-bootstrap-')) && 'bootstrap pending-webhook' || 'deploy final' }} @${{ inputs.target_sha || github.event.workflow_run.head_sha || github.sha }}
 on:
   workflow_run:
     workflows: [CI]
     branches: [main]
     types: [completed]
+  push:
+    tags: ['phase4/billing-deploy-*', 'phase4/billing-bootstrap-*']
   workflow_dispatch:
+    inputs:
+      target_sha:
+        description: SHA completo de 40 caracteres validado pelo CI
+        required: true
+        type: string
+      target_ref:
+        description: Branch do mesmo CI (main ou feature autorizada)
+        required: true
+        type: string
+      bootstrap:
+        description: Subir somente health/LB sem credenciais MP, aguardando configurar o webhook
+        type: boolean
+        default: false
 permissions: { contents: read, actions: read }
 concurrency: { group: billing-deploy, cancel-in-progress: false }
 env:
@@ -14,17 +30,88 @@ env:
 jobs:
   deploy:
     environment: homolog
-    if: github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && (startsWith(github.ref, 'refs/tags/phase4/billing-deploy-') || startsWith(github.ref, 'refs/tags/phase4/billing-bootstrap-'))) || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-latest
+    timeout-minutes: 35
+    env:
+      TARGET_SHA: ${{ inputs.target_sha || github.event.workflow_run.head_sha || github.sha }}
+      TARGET_REF: ${{ inputs.target_ref || github.event.workflow_run.head_branch || vars.DEPLOY_SOURCE_REF || 'feature/aws-mercadopago-test' }}
+      BILLING_BOOTSTRAP: ${{ (inputs.bootstrap || startsWith(github.ref, 'refs/tags/phase4/billing-bootstrap-')) && 'true' || 'false' }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME || 'oficina-homolog-eks' }}
     steps:
-      - uses: actions/checkout@v4
-        with: { ref: "${{ github.event.workflow_run.head_sha || github.sha }}" }
+      - name: Checkout reviewed deployment controls
+        uses: actions/checkout@v4
+        with: { ref: "${{ github.workflow_sha }}" }
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - name: Require exact successful CI including Sonar before AWS or image publication
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          REQUIRED_DEPLOY_GATES: Quality,Integration,Container,Sonar
+          CI_WORKFLOW_FILE: ci.yml
+          DISPATCH_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
+          DISPATCH_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref || '' }}
+        run: node scripts/check-deploy-gates.mjs
+      - name: Checkout only the verified deployment SHA
+        uses: actions/checkout@v4
+        with: { ref: "${{ env.TARGET_SHA }}" }
+      - name: Validate required deployment inputs
+        env:
+          DATABASE_SECRET_ID: ${{ vars.DATABASE_SECRET_ID }}
+          JWT_SECRET_ID: ${{ vars.JWT_SECRET_ID }}
+          AUTH_CLIENT_LOOKUP_SECRET_ID: ${{ vars.AUTH_CLIENT_LOOKUP_SECRET_ID }}
+          BILLING_RUNTIME_SECRET_ID: ${{ vars.BILLING_RUNTIME_SECRET_ID }}
+          BILLING_QUEUE_URL: ${{ vars.BILLING_QUEUE_URL }}
+          OS_QUEUE_URL: ${{ vars.OS_QUEUE_URL }}
+          MP_NOTIFICATION_URL: ${{ vars.MP_NOTIFICATION_URL }}
+          MP_BACK_URL: ${{ vars.MP_BACK_URL }}
+        run: |
+          set -euo pipefail
+          for key in DATABASE_SECRET_ID JWT_SECRET_ID AUTH_CLIENT_LOOKUP_SECRET_ID BILLING_RUNTIME_SECRET_ID BILLING_QUEUE_URL OS_QUEUE_URL EKS_CLUSTER_NAME; do
+            test -n "${!key}" || { echo "Configure $key"; exit 1; }
+          done
+          if [ "$BILLING_BOOTSTRAP" != true ]; then
+            [[ "$MP_NOTIFICATION_URL" == https://* && "$MP_BACK_URL" == https://* ]] || { echo 'Final deploy requires HTTPS MP_NOTIFICATION_URL and MP_BACK_URL'; exit 1; }
+          fi
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
+      - name: Bootstrap internal runtime without Mercado Pago credentials
+        if: env.BILLING_BOOTSTRAP == 'true'
+        env:
+          RUNTIME_COMPONENT: billing
+          JWT_SECRET_ID: ${{ vars.JWT_SECRET_ID }}
+          AUTH_CLIENT_LOOKUP_SECRET_ID: ${{ vars.AUTH_CLIENT_LOOKUP_SECRET_ID }}
+          BILLING_RUNTIME_SECRET_ID: ${{ vars.BILLING_RUNTIME_SECRET_ID }}
+        run: node scripts/configure-runtime-secrets.mjs
+      - name: Configure final runtime with a verified test seller and signed webhook
+        if: env.BILLING_BOOTSTRAP != 'true'
+        env:
+          RUNTIME_COMPONENT: billing
+          JWT_SECRET_ID: ${{ vars.JWT_SECRET_ID }}
+          AUTH_CLIENT_LOOKUP_SECRET_ID: ${{ vars.AUTH_CLIENT_LOOKUP_SECRET_ID }}
+          BILLING_RUNTIME_SECRET_ID: ${{ vars.BILLING_RUNTIME_SECRET_ID }}
+          MP_ACCESS_TOKEN: ${{ secrets.MP_ACCESS_TOKEN }}
+          MP_WEBHOOK_SECRET: ${{ secrets.MP_WEBHOOK_SECRET }}
+        run: node scripts/configure-runtime-secrets.mjs
+      - name: Verify the runtime mode before image publication
+        env:
+          BILLING_RUNTIME_SECRET_ID: ${{ vars.BILLING_RUNTIME_SECRET_ID }}
+        run: |
+          set -euo pipefail
+          umask 077
+          aws secretsmanager get-secret-value --secret-id "$BILLING_RUNTIME_SECRET_ID" --query SecretString --output text > "$RUNNER_TEMP/billing-runtime.json"
+          jq -e '.AUTH_CLIENT_LOOKUP_TOKEN | type == "string" and length >= 32' "$RUNNER_TEMP/billing-runtime.json" > /dev/null
+          if [ "$BILLING_BOOTSTRAP" = true ]; then
+            jq -e 'has("MP_ACCESS_TOKEN") == false and has("MP_WEBHOOK_SECRET") == false' "$RUNNER_TEMP/billing-runtime.json" > /dev/null || { echo 'Runtime already has payment configuration; use final deploy instead of bootstrap'; exit 1; }
+            echo 'Billing bootstrap: payment credentials absent; waiting for Gateway and Mercado Pago webhook configuration.' >> "$GITHUB_STEP_SUMMARY"
+          else
+            jq -e '(.MP_ACCESS_TOKEN | type == "string" and length > 0) and (.MP_WEBHOOK_SECRET | type == "string" and length > 0)' "$RUNNER_TEMP/billing-runtime.json" > /dev/null || { echo 'Final deploy requires the complete Mercado Pago token/webhook pair'; exit 1; }
+          fi
       - uses: aws-actions/amazon-ecr-login@v2
         id: ecr
       - uses: docker/setup-buildx-action@v3
@@ -32,35 +119,58 @@ jobs:
         with:
           context: .
           push: true
-          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.workflow_run.head_sha }}-${{ github.run_number }}
+          tags: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.TARGET_SHA }}-${{ github.run_id }}-${{ github.run_attempt }}
       - uses: azure/setup-helm@v4
+      - name: Select a current kubectl patch matching the cluster minor
+        id: kubectl
+        run: |
+          set -euo pipefail
+          minor="$(aws eks describe-cluster --name "$EKS_CLUSTER_NAME" --query cluster.version --output text)"
+          [[ "$minor" =~ ^1\.[0-9]+$ ]] || exit 1
+          version="$(curl --fail --silent --show-error --location "https://dl.k8s.io/release/stable-${minor}.txt")"
+          [[ "$version" == "v${minor}."* && "$version" =~ ^v1\.[0-9]+\.[0-9]+$ ]] || exit 1
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: ${{ steps.kubectl.outputs.version }}
       - name: Configure deployment secrets
         env:
           DATABASE_SECRET_ID: ${{ vars.DATABASE_SECRET_ID }}
           JWT_SECRET_ID: ${{ vars.JWT_SECRET_ID }}
-          BILLING_RUNTIME_SECRET_ID: ${{ vars.BILLING_RUNTIME_SECRET_ID }}
         run: |
           set -euo pipefail
-          aws eks update-kubeconfig --name oficina-homolog-eks
+          aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME"
+          umask 077
           mkdir -p "$RUNNER_TEMP/billing-secrets"
-          aws secretsmanager get-secret-value --secret-id "$DATABASE_SECRET_ID" --query SecretString --output text | jq -r '.url' > "$RUNNER_TEMP/billing-secrets/DATABASE_URL"
-          aws secretsmanager get-secret-value --secret-id "$JWT_SECRET_ID" --query SecretString --output text | jq -r '.secret' > "$RUNNER_TEMP/billing-secrets/JWT_SECRET"
-          aws secretsmanager get-secret-value --secret-id "$BILLING_RUNTIME_SECRET_ID" --query SecretString --output text > "$RUNNER_TEMP/billing-runtime.json"
-          for key in AUTH_CLIENT_LOOKUP_TOKEN MP_ACCESS_TOKEN MP_WEBHOOK_SECRET; do jq -er ".$key" "$RUNNER_TEMP/billing-runtime.json" > "$RUNNER_TEMP/billing-secrets/$key"; done
-          printf '%s' '${{ secrets.AWS_ACCESS_KEY_ID }}' > "$RUNNER_TEMP/billing-secrets/AWS_ACCESS_KEY_ID"
-          printf '%s' '${{ secrets.AWS_SECRET_ACCESS_KEY }}' > "$RUNNER_TEMP/billing-secrets/AWS_SECRET_ACCESS_KEY"
-          printf '%s' '${{ secrets.AWS_SESSION_TOKEN }}' > "$RUNNER_TEMP/billing-secrets/AWS_SESSION_TOKEN"
-          for file in "$RUNNER_TEMP/billing-secrets/"*; do value="$(cat "$file")"; printf '%s' "$value" > "$file"; done
+          aws secretsmanager get-secret-value --secret-id "$DATABASE_SECRET_ID" --query SecretString --output text | jq -ej '.url | select(type == "string" and length > 0)' > "$RUNNER_TEMP/billing-secrets/DATABASE_URL"
+          aws secretsmanager get-secret-value --secret-id "$JWT_SECRET_ID" --query SecretString --output text | jq -ej '.secret | select(type == "string" and length >= 32)' > "$RUNNER_TEMP/billing-secrets/JWT_SECRET"
+          jq -ej '.AUTH_CLIENT_LOOKUP_TOKEN' "$RUNNER_TEMP/billing-runtime.json" > "$RUNNER_TEMP/billing-secrets/AUTH_CLIENT_LOOKUP_TOKEN"
+          if [ "$BILLING_BOOTSTRAP" != true ]; then
+            for key in MP_ACCESS_TOKEN MP_WEBHOOK_SECRET; do jq -ej --arg key "$key" '.[$key]' "$RUNNER_TEMP/billing-runtime.json" > "$RUNNER_TEMP/billing-secrets/$key"; done
+          fi
+          printf '%s' "$AWS_ACCESS_KEY_ID" > "$RUNNER_TEMP/billing-secrets/AWS_ACCESS_KEY_ID"
+          printf '%s' "$AWS_SECRET_ACCESS_KEY" > "$RUNNER_TEMP/billing-secrets/AWS_SECRET_ACCESS_KEY"
+          printf '%s' "$AWS_SESSION_TOKEN" > "$RUNNER_TEMP/billing-secrets/AWS_SESSION_TOKEN"
           kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
           kubectl create secret generic oficina-billing -n "$NAMESPACE" --from-file="$RUNNER_TEMP/billing-secrets" --dry-run=client -o yaml | kubectl apply -f -
       - name: Deploy immutable image
+        env:
+          BILLING_QUEUE_URL: ${{ vars.BILLING_QUEUE_URL }}
+          OS_QUEUE_URL: ${{ vars.OS_QUEUE_URL }}
+          MP_NOTIFICATION_URL: ${{ vars.MP_NOTIFICATION_URL }}
+          MP_BACK_URL: ${{ vars.MP_BACK_URL }}
         run: |
+          set -euo pipefail
           helm upgrade --install oficina-billing ./helm/oficina-billing --namespace "$NAMESPACE" --atomic --wait --timeout 8m \
             --set image.repository=${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }} \
-            --set image.tag=${{ github.event.workflow_run.head_sha }}-${{ github.run_number }} \
-            --set config.INBOX_QUEUE_URL='${{ vars.BILLING_QUEUE_URL }}' --set config.OS_QUEUE_URL='${{ vars.OS_QUEUE_URL }}' \
-            --set config.MP_NOTIFICATION_URL='${{ vars.MP_NOTIFICATION_URL }}' --set config.MP_BACK_URL='${{ vars.MP_BACK_URL }}' \
-            --set config.DD_VERSION='${{ github.event.workflow_run.head_sha }}'
+            --set image.tag=${{ env.TARGET_SHA }}-${{ github.run_id }}-${{ github.run_attempt }} \
+            --set-string config.INBOX_QUEUE_URL="$BILLING_QUEUE_URL" --set-string config.OS_QUEUE_URL="$OS_QUEUE_URL" \
+            --set-string config.MP_NOTIFICATION_URL="$MP_NOTIFICATION_URL" --set-string config.MP_BACK_URL="$MP_BACK_URL" \
+            --set-string config.DD_VERSION="$TARGET_SHA"
           kubectl rollout status deployment/oficina-billing -n "$NAMESPACE" --timeout=5m
+          hostname="$(kubectl get svc oficina-billing -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+          mode=final
+          if [ "$BILLING_BOOTSTRAP" = true ]; then mode='bootstrap pending-webhook (sem credenciais MP)'; fi
+          printf '### Billing deploy\n- SHA: `%s`\n- Modo: %s\n- Backend para Gateway: http://%s:3001\n' "$TARGET_SHA" "$mode" "$hostname" >> "$GITHUB_STEP_SUMMARY"
       - if: always()
         run: rm -rf "$RUNNER_TEMP/billing-secrets" "$RUNNER_TEMP/billing-runtime.json"

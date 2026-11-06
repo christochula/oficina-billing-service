@@ -58,7 +58,7 @@ describe('Billing business behavior', () => {
     await approved(); await expect(service.checkout('os-1', context, client)).rejects.toThrow('apos reparo');
     const command = message('CreatePayment'); await service.command(command); await service.command(command);
     const result = await service.checkout('os-1', context, client);
-    expect(result.payment).toMatchObject({ status: 'PENDING', checkoutUrl: preference.sandbox_init_point, amountCents: 5000 });
+    expect(result.payment).toMatchObject({ status: 'PENDING', checkoutUrl: preference.init_point, amountCents: 5000 });
     expect(provider.create).toHaveBeenCalledTimes(1);
     await service.command(message('ReleaseBudgetPreparation')); expect(store.events.at(-1)?.type).toBe('CommandFailed');
   });
@@ -101,10 +101,27 @@ describe('Billing business behavior', () => {
     provider.getPayment.mockResolvedValue({ ...payment, status: 'rejected' }); await service.webhook('123'); expect((await service.get('os-1')).payment?.status).toBe('REJECTED');
     expect((await service.get('os-1')).repairCompleted).toBe(true);
   });
-  it('reconciles approved payment without webhook and selects production checkout', async () => {
-    service = new BillingService(store, provider, false); await approved(); await service.command(message('CreatePayment'));
+  it('reconciles approved payment without webhook and always uses Checkout Pro init_point', async () => {
+    await approved(); await service.command(message('CreatePayment'));
     expect((await service.get('os-1')).payment?.checkoutUrl).toBe(preference.init_point);
     provider.findPayments.mockResolvedValue([{ id: 'p', status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50 }]);
     await service.reconcile(); expect((await service.get('os-1')).status).toBe('PAID');
+  });
+  it('recovers test payment approval after rejection when the second webhook is lost', async () => {
+    await approved(); await service.command(message('CreatePayment'));
+    provider.getPayment.mockResolvedValue({ id: 'rejected-attempt', status: 'rejected', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50, live_mode: false });
+    await service.webhook('rejected-attempt');
+    expect((await service.get('os-1')).payment?.status).toBe('REJECTED');
+    expect((await service.get('os-1')).status).toBe('AWAITING_PAYMENT');
+    provider.findPayments.mockResolvedValue([
+      { id: 'approved-attempt', status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50, live_mode: false },
+      { id: 'rejected-attempt', status: 'rejected', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50, live_mode: false },
+    ]);
+    await service.reconcile(); await service.reconcile();
+    expect((await service.get('os-1')).status).toBe('PAID');
+    expect((await service.get('os-1')).payment?.paymentId).toBe('approved-attempt');
+    expect(store.events.filter(event => event.type === 'PaymentConfirmed')).toHaveLength(1);
+    expect(store.events.at(-1)?.sagaId).toBe(context.sagaId);
+    expect(provider.create).toHaveBeenCalledTimes(1);
   });
 });

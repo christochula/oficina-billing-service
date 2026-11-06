@@ -1,7 +1,7 @@
-# Evidência local de validação — 04/11/2026
+# Evidência local de validação — 05/11/2026
 
 - `npm run build`: aprovado, TypeScript estrito.
-- `npm run test:cov -- --silent`: 64 testes aprovados em 9 suítes; statements 99,07%, branches 93%, funções 98,79%, linhas 99,65%. Inclui corrida de checkout/contexto da Saga, contrato DogStatsD e propagação do span HTTP ativo até o evento sem headers do browser. Relatório completo gerado em `coverage/lcov-report/index.html` (artefato local, não versionado).
+- `npm run test:cov -- --silent`: 76 testes aprovados em 9 suítes; statements 99,09%, branches 92,21%, funções 98,8%, linhas 99,66%. Inclui Checkout Pro usando somente `init_point`, retorno seguro para a OS, rejeição de configuração insegura, recuperação de aprovação após recusa sem webhook, corrida de checkout/contexto da Saga, contrato DogStatsD e propagação do span HTTP ativo. Relatório completo gerado em `coverage/lcov-report/index.html` (artefato local, não versionado).
 - `npm run test:integration` contra PostgreSQL 16 real em Docker: 2 testes aprovados; rollback total de estado/inbox/outbox e deduplicação concorrente com recuperação do outbox.
 - `terraform -chdir=infra init -backend=false`, `validate` e `fmt -check`: aprovados; nenhum recurso AWS aplicado.
 - `helm lint helm/oficina-billing` com Helm 3.17.3: aprovado, sem erros.

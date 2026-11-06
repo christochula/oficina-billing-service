@@ -12,7 +12,7 @@ export class MemoryStore implements BillingStore {
     const value = await fn({ order, emit: (type, payload) => events.push({ type, payload, osId: id, ...ctx }) });
     this.orders.set(id, order); this.events.push(...events); if (messageId) this.inbox.add(messageId); return value;
   }
-  async pendingPayments() { return [...this.orders.values()].filter(order => ['CREATING', 'UNKNOWN', 'PENDING'].includes(order.payment?.status ?? '')); }
+  async pendingPayments() { return [...this.orders.values()].filter(order => ['CREATING', 'UNKNOWN', 'PENDING', 'REJECTED'].includes(order.payment?.status ?? '')); }
 }
 export const orderInput = { osId: 'os-1', filialId: 'branch-1', clienteId: 'client-1', mecanicoId: 'mechanic-1' };
 export const client = { sub: 'client-1', role: 'CLIENTE' };
