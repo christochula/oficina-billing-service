@@ -68,6 +68,10 @@ Configure `MP_ACCESS_TOKEN` de um **vendedor de teste verificado no painel Merca
 
 Checkout Pro sempre redireciona para o `init_point` retornado pela preferência, inclusive nos testes com vendedor/comprador de teste. Não existe toggle `MP_SANDBOX` no serviço. `MP_API_BASE_URL` no Helm é `https://api.mercadopago.com`. HTTP é aceito apenas em `NODE_ENV=test/development` para o simulador local; valores recebidos do checkout não são usados para declarar pagamento aprovado.
 
+O procedimento oficial para testar Checkout Pro Preferences usa a credencial de produção da **conta de teste do vendedor** e o `init_point` de produção, com sessão do comprador de teste e cartão oficial de teste: [orientação para testar integrações](https://www.mercadopago.com.br/developers/pt/news/2023/11/16/Questions-on-how-to-test-your-integration--) e [contas de teste Checkout Pro](https://www.mercadopago.com.br/developers/pt/docs/checkout-pro-preferences/test-accounts). A documentação atual também explica o prefixo `APP_USR` nesse fluxo.
+
+Na validação de homologação de 06/11/2026, o vendedor apresentou `test_user` e site `MLB` na API oficial. O User ID do comprador exibido em **Contas de teste** no painel foi conferido com o pagador; o checkout usou Mastercard oficial de teste com final 3311. O pagamento de R$175,00 foi aprovado, o webhook assinado recebeu HTTP201 e a OS foi liberada para entrega. A API retornou `live_mode=true`, e a consulta pública do comprador não apresentou a tag `test_user`; a identificação desse comprador como conta de teste foi conferida no painel. A flag é registrada como observada, sem afirmar `live_mode=false`.
+
 Na AWS, `MP_NOTIFICATION_URL` deve ser a URL HTTPS pública do Gateway terminando em `/api/v1/billing/webhooks/mercadopago`. `MP_BACK_URL` deve ser a URL HTTPS pública do portal; o adapter preserva origem, path de stage e query configurados e substitui o fragmento por `#/ordens/<osId codificado>` em sucesso, recusa e pendência. Credenciais na URL, esquemas alternativos e URLs locais em produção são rejeitados antes da criação da preferência. `auto_return=approved` é enviado somente para retorno HTTPS público; o simulador HTTP local continua suportado sem esse atributo.
 
 A tentativa e chave idempotente são persistidas **antes** do POST da preferência, que é feito uma única vez. Timeout/erro de resultado desconhecido muda para `UNKNOWN`. A cada 15 ciclos o reconciliador busca preferência e pagamentos por `external_reference=osId:budgetVersion`; ele nunca repete automaticamente o POST. Ausência de resultado mantém o estado pendente para reconciliação/intervenção, evitando duplicidade. Não se presume que Preferences ofereça garantia suficiente de idempotência apenas pelo header.
@@ -90,7 +94,7 @@ TEST_DATABASE_URL=postgresql://billing:billing@localhost:5433/oficina_billing np
 
 Threshold de 80% em statements, branches, funções e linhas para **todo código de negócio, HTTP, autenticação, persistência e worker**; somente bootstrap/wiring são excluídos. Testes de domínio, autorização/ownership, webhook HMAC, adaptação Mercado Pago, compensação, duplicatas e HTTP NestJS. Integração com PostgreSQL real verifica rollback total de estado/inbox/outbox, concorrência de duplicatas e recuperação do publicador. SQL em memória nos unitários não substitui essa validação real.
 
-CI publica o artefato `billing-coverage`, executa integração PostgreSQL, lint/tipos, build, container, Helm e Terraform validate. O check Sonar aguarda quality gate e **falha** se faltarem token/projeto/organização. Links e evidências da execução GitHub Actions devem ser adicionados após o primeiro push: a cobertura local não comprova o estado remoto.
+CI publica o artefato `billing-coverage`, executa integração PostgreSQL, lint/tipos, build, container, Helm e Terraform validate. O check Sonar aguarda quality gate e **falha** se faltarem token/projeto/organização. O [CI publicado aprovado](https://github.com/christochula/oficina-billing-service/actions/runs/42214601975) e os relatórios ao final deste README comprovam a execução remota, separadamente da cobertura local.
 
 [Evidência local de build, cobertura, PostgreSQL real, Helm e Terraform](docs/evidence/validation.md).
 
@@ -109,3 +113,15 @@ A imagem usa tag imutável `SHA-run_id-run_attempt` e Helm `--atomic --wait` no 
 Datadog inicia antes do Nest, propaga `traceparent` em comandos/eventos e gera spans de processamento SQS. Se o browser não envia W3C válido, o middleware injeta o contexto do span HTTP ativo antes do controller/outbox; contexto recebido válido é preservado. Helm configura `DD_TRACE_PROPAGATION_STYLE_INJECT=datadog,tracecontext`. Com `DD_METRICS_ENABLED=true`, emite distribuição DogStatsD `oficina.api.request.duration_ms` em milissegundos com tags `method`, `status_code`, `service`, `env`, `version`. Falhas de telemetria não interrompem requests. Logs JSON incluem correlação/Saga e IDs de trace quando ativos; não registram token, CPF, connection string ou credenciais Mercado Pago.
 
 Aplicar proteção remota de `main`: PR obrigatório, uma aprovação, checks `Quality`, `Integration`, `Container`, `Sonar`. `.github/settings.yml` documenta as regras; sua presença não aplica nem comprova proteção no GitHub.
+
+## Evidências publicadas de CI, cobertura e deploy
+
+Snapshot de 06/11/2026, fonte implantada `952f4f14`:
+
+- [CI aprovado](https://github.com/christochula/oficina-billing-service/actions/runs/42214601975): checks `Quality`, `Integration`, `Container` e `Sonar`, incluindo quality gate obrigatório.
+- [SonarCloud](https://sonarcloud.io/dashboard?id=christochula-oficina_oficina-billing-service): cobertura **95,7%**, linhas 99,7% e branches 92,2%; quality gate aprovado. São métricas Sonar, distintas do resumo Jest local.
+- [Relatório de cobertura](https://github.com/christochula/oficina-billing-service/actions/runs/42214601975/artifacts/13501326628): artifact `billing-coverage` da mesma execução CI.
+- [Deploy final aprovado](https://github.com/christochula/oficina-billing-service/actions/runs/42240956838): validação do vendedor de teste e do par token/HMAC, imagem imutável do SHA `952f4f14eb9c8a4e74393616acb0597746bbe4b4`, duas réplicas prontas e health público HTTP200 após o rollout.
+- [OpenAPI público para Swagger](https://8phthn792m.execute-api.us-east-1.amazonaws.com/api/v1/billing/openapi.json) e [health pelo Gateway](https://8phthn792m.execute-api.us-east-1.amazonaws.com/api/v1/billing/health), verificados em 06/11/2026.
+
+A disponibilidade da homologação depende da sessão ativa do AWS Academy; renovar credenciais e fazer o deploy pelo GitHub Actions após a expiração.
