@@ -1,34 +1,174 @@
 name: Infrastructure
 on:
-  push:
-    branches: [main]
-    paths: ["infra/**", ".github/workflows/infra.yml"]
   workflow_dispatch:
     inputs:
-      apply:
-        description: Aplicar o plano na AWS
-        type: boolean
-        default: false
-permissions: { contents: read }
-concurrency: { group: billing-infrastructure, cancel-in-progress: false }
+      target_ref:
+        description: Branch revisada; deve ser a branch selecionada no dispatch
+        type: string
+        required: true
+        default: feature/aws-mercadopago-test
+      target_sha:
+        description: SHA completo aprovado no CI desta branch
+        type: string
+        required: true
+      operation:
+        description: Plan primeiro; apply exige o ID do plano revisado
+        type: choice
+        options: [plan, apply]
+        default: plan
+  push:
+    tags: [phase4/billing-plan-*, phase4/billing-apply-*]
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: billing-infrastructure
+  cancel-in-progress: false
+env:
+  AWS_REGION: us-east-1
+  TF_IN_AUTOMATION: 'true'
+  TF_INPUT: 'false'
 jobs:
-  infrastructure:
-    environment: homolog
+  gate:
     runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.request.outputs.sha }}
+      ref: ${{ steps.request.outputs.ref }}
+      operation: ${{ steps.request.outputs.operation }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with: {node-version: 22}
+      - name: Verify one complete CI run for the exact branch and commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_SHA: ${{ inputs.target_sha || github.sha }}
+          TARGET_REF: ${{ inputs.target_ref || vars.DEPLOY_SOURCE_REF || 'feature/aws-mercadopago-test' }}
+          DISPATCH_SHA: ${{ github.event_name == 'workflow_dispatch' && github.sha || '' }}
+          DISPATCH_REF: ${{ github.event_name == 'workflow_dispatch' && github.ref || '' }}
+          REQUIRED_DEPLOY_GATES: Quality,Integration,Container,Sonar
+          CI_WORKFLOW_FILE: ci.yml
+        run: node scripts/check-deploy-gates.mjs
+      - name: Resolve the reviewed infrastructure operation
+        id: request
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TAG_NAME: ${{ github.ref_name }}
+          REQUESTED_OPERATION: ${{ inputs.operation }}
+          TARGET_SHA: ${{ inputs.target_sha || github.sha }}
+          TARGET_REF: ${{ inputs.target_ref || vars.DEPLOY_SOURCE_REF || 'feature/aws-mercadopago-test' }}
+        run: |
+          set -euo pipefail
+          case "$EVENT_NAME" in
+            workflow_dispatch) operation="$REQUESTED_OPERATION" ;;
+            push)
+              case "$TAG_NAME" in
+                phase4/billing-plan-*) operation=plan ;;
+                phase4/billing-apply-*) operation=apply ;;
+                *) echo 'Unsupported infrastructure tag'; exit 1 ;;
+              esac ;;
+            *) exit 1 ;;
+          esac
+          case "$operation" in plan|apply) ;; *) exit 1 ;; esac
+          printf 'sha=%s\nref=%s\noperation=%s\n' "$TARGET_SHA" "$TARGET_REF" "$operation" >> "$GITHUB_OUTPUT"
+  infrastructure:
+    needs: gate
+    environment: homolog
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      TF_VAR_vpc_id: ${{ vars.VPC_ID }}
+      TF_VAR_private_subnet_ids: ${{ vars.PRIVATE_SUBNET_IDS_JSON }}
+      TF_VAR_eks_node_security_group_id: ${{ vars.EKS_NODE_SECURITY_GROUP_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with: {node-version: 22}
+      - name: Require a successful reviewed plan for this exact commit
+        if: needs.gate.outputs.operation == 'apply'
+        id: reviewed
+        uses: actions/github-script@v7
+        env:
+          APPROVED_PLAN_RUN_ID: ${{ vars.BILLING_APPROVED_PLAN_RUN_ID }}
+          TARGET_SHA: ${{ needs.gate.outputs.sha }}
+        with:
+          script: |
+            const id = Number(process.env.APPROVED_PLAN_RUN_ID);
+            if (!Number.isSafeInteger(id) || id <= 0) throw new Error('Review a plan and configure BILLING_APPROVED_PLAN_RUN_ID first');
+            const { data: run } = await github.rest.actions.getWorkflowRun({ ...context.repo, run_id: id });
+            const repository = `${context.repo.owner}/${context.repo.repo}`;
+            if (run.head_sha !== process.env.TARGET_SHA || run.conclusion !== 'success' || run.head_repository?.full_name !== repository || run.path.split('@')[0] !== '.github/workflows/infra.yml') throw new Error('Approved plan must be successful in this repository and exact commit');
+            const name = `billing-plan-${process.env.TARGET_SHA}-${id}`;
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, { ...context.repo, run_id: id, per_page: 100 });
+            if (!artifacts.some(artifact => artifact.name === name && !artifact.expired)) throw new Error('Approved run has no reviewed text plan');
+            core.setOutput('name', name);
+      - uses: actions/download-artifact@v4
+        if: needs.gate.outputs.operation == 'apply'
+        with:
+          name: ${{ steps.reviewed.outputs.name }}
+          run-id: ${{ vars.BILLING_APPROVED_PLAN_RUN_ID }}
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/billing-reviewed
+      - name: Validate required infrastructure configuration
+        env:
+          BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          test -n "$BUCKET" && test -n "$TF_VAR_vpc_id" && test -n "$TF_VAR_eks_node_security_group_id" || { echo 'Configure TF_STATE_BUCKET, VPC_ID, EKS_NODE_SECURITY_GROUP_ID'; exit 1; }
+          printf '%s' "$TF_VAR_private_subnet_ids" | jq -e 'type == "array" and length >= 2 and all(.[]; type == "string" and startswith("subnet-"))' > /dev/null || { echo 'Configure PRIVATE_SUBNET_IDS_JSON with at least two subnets'; exit 1; }
       - uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: us-east-1
+          aws-region: ${{ env.AWS_REGION }}
       - uses: hashicorp/setup-terraform@v3
-      - run: terraform -chdir=infra init -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" -backend-config="key=oficina-fase4/billing/terraform.tfstate" -backend-config="region=us-east-1" -backend-config="encrypt=true" -backend-config="use_lockfile=true"
-      - run: terraform -chdir=infra validate && terraform -chdir=infra plan -out=tfplan
+        with: {terraform_version: 1.16.0}
+      - name: Initialize the exclusive service state
         env:
-          TF_VAR_vpc_id: ${{ vars.VPC_ID }}
-          TF_VAR_private_subnet_ids: ${{ vars.PRIVATE_SUBNET_IDS_JSON }}
-          TF_VAR_eks_node_security_group_id: ${{ vars.EKS_NODE_SECURITY_GROUP_ID }}
-      - if: github.ref == 'refs/heads/main' && (github.event_name == 'push' || inputs.apply)
-        run: terraform -chdir=infra apply -auto-approve tfplan
+          TF_STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+        run: |
+          set -euo pipefail
+          aws sts get-caller-identity --query '{Account:Account,Arn:Arn}' --output json
+          terraform -chdir=infra init -input=false -backend-config="bucket=${TF_STATE_BUCKET}" -backend-config="key=oficina-fase4/billing/terraform.tfstate" -backend-config="region=${AWS_REGION}" -backend-config="encrypt=true" -backend-config="use_lockfile=true"
+          terraform -chdir=infra fmt -check
+          terraform -chdir=infra validate
+      - name: Plan without resource deletion or replacement
+        env:
+          TARGET_SHA: ${{ needs.gate.outputs.sha }}
+          TARGET_REF: ${{ needs.gate.outputs.ref }}
+          PLAN_WORKFLOW_FILE: infra.yml
+          PLAN_OPERATION: ${{ needs.gate.outputs.operation }}
+          PLAN_SCOPE: billing
+        run: |
+          set -euo pipefail
+          terraform -chdir=infra plan -input=false -lock-timeout=5m -out="$RUNNER_TEMP/billing.tfplan"
+          terraform -chdir=infra show -json "$RUNNER_TEMP/billing.tfplan" | node scripts/terraform-plan-fingerprint.mjs > "$RUNNER_TEMP/billing-plan-review.json"
+          terraform -chdir=infra show -no-color "$RUNNER_TEMP/billing.tfplan" > "$RUNNER_TEMP/billing-plan.txt"
+      - name: Publish only the redacted text plan for review
+        if: needs.gate.outputs.operation == 'plan'
+        uses: actions/upload-artifact@v4
+        with:
+          name: billing-plan-${{ needs.gate.outputs.sha }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/billing-plan.txt
+            ${{ runner.temp }}/billing-plan-review.json
+          retention-days: 7
+          if-no-files-found: error
+      - name: Apply only an identical reviewed plan
+        if: needs.gate.outputs.operation == 'apply'
+        run: |
+          set -euo pipefail
+          cmp -s "$RUNNER_TEMP/billing-plan.txt" "$RUNNER_TEMP/billing-reviewed/billing-plan.txt" || { echo 'Plan changed after review; request and review a new plan'; exit 1; }
+          node scripts/terraform-plan-fingerprint.mjs --compare "$RUNNER_TEMP/billing-reviewed/billing-plan-review.json" "$RUNNER_TEMP/billing-plan-review.json"
+          terraform -chdir=infra apply -input=false -lock-timeout=5m "$RUNNER_TEMP/billing.tfplan"
+      - name: Delete ephemeral binary plans
+        if: always()
+        run: rm -f "$RUNNER_TEMP/billing.tfplan"
