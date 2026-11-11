@@ -116,6 +116,19 @@ Aplicar proteção remota de `main`: PR obrigatório, uma aprovação, checks `Q
 
 ## Evidências publicadas de CI, cobertura e deploy
 
+### Snapshot de 10/11/2026, 21h45 (America/Sao_Paulo)
+
+A **OS #2**, `os06a521bf-0d80-49b5-8dd2-1a1c9c961588`, terminou **ENTREGUE**, com pagamento de **R$175,00**. O fluxo observado passou por falta de estoque e preparação `COMPENSATED`, reposição, retry com nova Saga, preparação `COMPLETED`, reparo, Checkout Pro TEST aprovado e entrega. A cobrança ocorreu após o reparo.
+
+- [CI aprovado](https://github.com/christochula/oficina-billing-service/actions/runs/42928186959): `Quality`, `Integration`, `Container` e `Sonar` bem-sucedidos para o SHA `2335d610cfa3c53a838938d1c4c79d9835e90adb`.
+- [Deploy final aprovado](https://github.com/christochula/oficina-billing-service/actions/runs/42928569648): mesma revisão, imagem imutável, duas réplicas atualizadas/prontas e health HTTP200. O deploy final preservou a configuração Mercado Pago verificada.
+- Cobertura Jest desse código: **82 testes**, statements **99,15%**, branches **92,37%**, funções **97,82%**, linhas **99,68%**. O CI publica o artifact `billing-coverage`; esses percentuais são do Jest, não do painel Sonar.
+- A consulta canônica do pagamento confirmou referência da OS, valor **175 BRL** e as contas de teste conferidas para o cenário. O provedor retornou **`live_mode=true`**, valor preservado como observado. Em 11/11/2026 às **00:43:09.702Z**, o Billing registrou `billing.payment.checked` com `source=webhook`; o OS consumiu `PaymentConfirmed` e liberou a entrega. As evidências sanitizadas do provedor são mantidas localmente, sem publicar identificadores de pagamento ou dados de acesso.
+- Datadog foi validado na UI/API: latência HTTP dos três serviços, seis séries de filas e sete séries de Saga; **p95 com séries dos três serviços**. A amostra observada inclui um trace com OS, Billing e Production, além dos logs correlacionados das etapas da Saga. [Dashboard de homologação](https://app.datadoghq.com/dashboard/u6t-x9c-awx/oficina--operao-e-observabilidade--homolog).
+- [Guia para gravar a demonstração](https://github.com/christochula/oficina-api/blob/feature/phase4-distributed/docs/entrega/pronto-para-gravar.md), mantido no repositório OS.
+
+### Histórico de 06/11/2026 — OS #1
+
 Snapshot de 06/11/2026, fonte implantada `952f4f14`:
 
 - [CI aprovado](https://github.com/christochula/oficina-billing-service/actions/runs/42214601975): checks `Quality`, `Integration`, `Container` e `Sonar`, incluindo quality gate obrigatório.
