@@ -30,7 +30,7 @@ async function bootstrap(): Promise<void> {
   await billing.store.initialize();
   const document = SwaggerModule.createDocument(app, new DocumentBuilder().setTitle('Oficina Billing').setVersion('4.0.0').addBearerAuth().build());
   SwaggerModule.setup('api/docs', app, document);
-  const worker = new Worker(billing.store as PostgresStore, billing, new SQSClient({ region: process.env.AWS_REGION ?? 'us-east-1', ...(process.env.AWS_ENDPOINT_URL ? { endpoint: process.env.AWS_ENDPOINT_URL } : {}) }));
+  const worker = new Worker(billing.store as PostgresStore, billing, new SQSClient({ region: process.env.AWS_REGION ?? 'us-east-1', ...(process.env.AWS_ENDPOINT_URL ? { endpoint: process.env.AWS_ENDPOINT_URL } : {}) }), process.env, metrics);
   worker.start();
   await app.listen(Number(process.env.PORT ?? 3001), '0.0.0.0');
   const shutdown = async () => { worker.stop(); metrics.close(); await app.close(); await billing.store.close(); };

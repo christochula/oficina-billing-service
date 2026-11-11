@@ -13,4 +13,11 @@ describe('Datadog shared metric contract', () => {
     metrics.observe(2, 'POST', 500); expect(udp.send.mock.calls[0][0].toString()).toContain('service:oficina-billing-service,env:homolog,version:4.0.0');
     udp.send.mockImplementationOnce(() => { throw new Error('network'); }); expect(() => metrics.observe(3, 'GET', 200)).not.toThrow();
   });
+  it('emits processed/failed count metrics without message or customer IDs as tags', () => {
+    const udp = socket(); const metrics = new RequestMetrics({ DD_METRICS_ENABLED: 'true' }, () => udp as never);
+    metrics.messageProcessed(); metrics.messageProcessed(true);
+    expect(udp.send.mock.calls[0][0].toString()).toBe('oficina.messaging.processed:1|c|#queue:billing-commands,service:oficina-billing-service,env:homolog,version:4.0.0');
+    expect(udp.send.mock.calls[1][0].toString()).toContain('oficina.messaging.failed:1|c|#queue:billing-commands');
+    metrics.close();
+  });
 });

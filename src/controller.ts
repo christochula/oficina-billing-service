@@ -6,10 +6,12 @@ import { BillingService } from './billing';
 import { internalToken, JwtGuard } from './auth';
 import { verifyWebhook } from './mercadopago';
 import { Claims, Context } from './types';
+import { captureTraceparent } from './trace-context';
 
 type AuthRequest = Request & { claims: Claims };
 function context(req: Request, osId: string): Context {
-  return { sagaId: osId, correlationId: String(req.headers['x-correlation-id'] ?? randomUUID()), ...(req.headers.traceparent ? { traceparent: String(req.headers.traceparent) } : {}) };
+  const traceparent = captureTraceparent(typeof req.headers.traceparent === 'string' ? req.headers.traceparent : undefined);
+  return { sagaId: osId, correlationId: String(req.headers['x-correlation-id'] ?? randomUUID()), ...(traceparent ? { traceparent } : {}) };
 }
 @ApiTags('Billing')
 @ApiBearerAuth()

@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { authorize, makeBudget, requireApproved, validateEnvelope } from './domain';
 import { PaymentProvider, Preference, ProviderPayment } from './mercadopago';
 import { BillingStore, Claims, Context, Envelope, Order, Payment } from './types';
+import { captureTraceparent, withTraceIds } from './trace-context';
 
 export class BillingService {
   constructor(readonly store: BillingStore, readonly provider: PaymentProvider) {}
@@ -94,13 +95,14 @@ export class BillingService {
       emit('PaymentCreated', { checkoutUrl: url, preferenceId: preference.id });
     });
   }
-  async webhook(paymentId: string): Promise<void> { await this.acceptPayment(await this.provider.getPayment(paymentId)); }
-  private async acceptPayment(payment: ProviderPayment): Promise<void> {
+  async webhook(paymentId: string): Promise<void> { await this.acceptPayment(await this.provider.getPayment(paymentId), 'webhook'); }
+  private async acceptPayment(payment: ProviderPayment, source: 'webhook' | 'reconciliation'): Promise<void> {
     if (typeof payment.external_reference !== 'string') throw new BadRequestException('Referencia ausente');
     const separator = payment.external_reference.lastIndexOf(':');
     const osId = payment.external_reference.slice(0, separator);
     const snapshot = await this.store.get(osId);
-    const ctx: Context = { sagaId: snapshot.payment?.sagaId ?? osId, correlationId: snapshot.payment?.correlationId ?? `mp-${payment.id}`, ...(snapshot.payment?.traceparent ? { traceparent: snapshot.payment.traceparent } : {}) };
+    const traceparent = captureTraceparent(snapshot.payment?.traceparent);
+    const ctx: Context = { sagaId: snapshot.payment?.sagaId ?? osId, correlationId: snapshot.payment?.correlationId ?? `mp-${payment.id}`, ...(traceparent ? { traceparent } : {}) };
     await this.store.change(osId, ctx, ({ order, emit }) => {
       if (!order.payment || order.payment.externalReference !== payment.external_reference || payment.currency_id !== 'BRL' || !Number.isFinite(payment.transaction_amount) || Math.round(payment.transaction_amount * 100) !== order.payment.amountCents) throw new BadRequestException('Pagamento nao corresponde a OS/valor/moeda');
       if (order.payment.status === 'APPROVED') return;
@@ -112,6 +114,8 @@ export class BillingService {
         emit('PaymentPending', { providerStatus: payment.status, amountCents: order.payment.amountCents });
       }
     }, `mp:${payment.id}:${payment.status}`);
+    try { console.log(JSON.stringify(withTraceIds({ event: 'billing.payment.checked', source, os_id: osId, saga_id: ctx.sagaId, correlation_id: ctx.correlationId, payment_id: String(payment.id), providerApproved: payment.status === 'approved' }))); }
+    catch { /* Telemetry must not fail an already committed payment update. */ }
   }
   async reconcile(): Promise<void> {
     for (const order of await this.store.pendingPayments()) {
@@ -121,7 +125,7 @@ export class BillingService {
           const preference = await this.provider.findPreference(order.payment!.externalReference);
           if (preference) await this.savePreference(order.osId, ctx, preference);
         }
-        for (const payment of await this.provider.findPayments(order.payment!.externalReference)) await this.acceptPayment(payment);
+        for (const payment of await this.provider.findPayments(order.payment!.externalReference)) await this.acceptPayment(payment, 'reconciliation');
       } catch { /* Unknown outcomes remain durable for the next reconciliation; never repeat POST. */ }
     }
   }

@@ -8,6 +8,7 @@ import { BillingController, InternalController, HealthController, WebhookControl
 import { BillingService } from '../src/billing';
 import { MemoryStore, orderInput, items } from './helpers';
 import { traceContextMiddleware } from '../src/trace-context';
+import tracer from 'dd-trace';
 
 describe('HTTP boundary integration', () => {
   let app: INestApplication; let billing: BillingService;
@@ -24,7 +25,7 @@ describe('HTTP boundary integration', () => {
     } as never));
     await app.init();
   });
-  afterEach(async () => { await app.close(); });
+  afterEach(async () => { await app.close(); jest.restoreAllMocks(); });
   it('requires internal token and JWT, exposes idempotent internal snapshot', async () => {
     await request(app.getHttpServer()).post('/api/v1/billing/internal/orders').send(orderInput).expect(401);
     await request(app.getHttpServer()).post('/api/v1/billing/internal/orders').set('X-Internal-Token', 'internal').send(orderInput).expect(201);
@@ -57,5 +58,16 @@ describe('HTTP boundary integration', () => {
     const store = billing.store as MemoryStore;
     expect(store.events.find(event => event.type === 'BudgetGenerated')?.traceparent)
       .toBe('00-1234567890abcdef1234567890abcdef-1234567890abcdef-01');
+  });
+  it('uses the local HTTP child in the outbox instead of re-emitting the caller parent', async () => {
+    await billing.create(orderInput);
+    const child = '00-1234567890abcdef1234567890abcdef-3333333333333333-01';
+    jest.spyOn(tracer, 'scope').mockReturnValue({ active: () => ({ context: () => ({}) }) } as never);
+    jest.spyOn(tracer, 'inject').mockImplementation((_span, _format, carrier) => { (carrier as Record<string,string>).traceparent = child; });
+    await request(app.getHttpServer()).put('/api/v1/billing/orders/os-1/budget')
+      .set('Authorization', `Bearer ${jwt('mechanic-1', 'MECANICO')}`)
+      .set('traceparent', '00-1234567890abcdef1234567890abcdef-1111111111111111-01')
+      .send({ items }).expect(200);
+    expect((billing.store as MemoryStore).events.find(event => event.type === 'BudgetGenerated')?.traceparent).toBe(child);
   });
 });

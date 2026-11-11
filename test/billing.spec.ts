@@ -1,11 +1,13 @@
 import { BillingService } from '../src/billing';
 import { MemoryStore, orderInput, client, mechanic, context, items, message, admin } from './helpers';
+import tracer from 'dd-trace';
 
 describe('Billing business behavior', () => {
   let store: MemoryStore; let service: BillingService;
   const preference = { id: 'pref-1', init_point: 'https://pay.example/1', sandbox_init_point: 'https://sandbox.example/1' };
   const provider = { create: jest.fn(), findPreference: jest.fn(), findPayments: jest.fn(), getPayment: jest.fn() };
   beforeEach(async () => { jest.resetAllMocks(); store = new MemoryStore(); service = new BillingService(store, provider); provider.create.mockResolvedValue(preference); provider.findPayments.mockResolvedValue([]); await service.create(orderInput); });
+  afterEach(() => jest.restoreAllMocks());
   async function approved() { await service.budget('os-1', items, mechanic, context); await service.decision('os-1', true, client, context); }
   it('generates versioned budgets, client approval and idempotent repeated decision', async () => {
     await service.budget('os-1', items, mechanic, context); await service.budget('os-1', items, admin, context);
@@ -102,10 +104,25 @@ describe('Billing business behavior', () => {
     expect((await service.get('os-1')).repairCompleted).toBe(true);
   });
   it('reconciles approved payment without webhook and always uses Checkout Pro init_point', async () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
     await approved(); await service.command(message('CreatePayment'));
     expect((await service.get('os-1')).payment?.checkoutUrl).toBe(preference.init_point);
     provider.findPayments.mockResolvedValue([{ id: 'p', status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50 }]);
     await service.reconcile(); expect((await service.get('os-1')).status).toBe('PAID');
+    expect(JSON.parse(log.mock.calls.at(-1)![0] as string)).toMatchObject({ event: 'billing.payment.checked', source: 'reconciliation', os_id: 'os-1', saga_id: context.sagaId });
+  });
+  it('persists the verified webhook span in PaymentConfirmed and records only safe provenance', async () => {
+    await approved(); await service.command(message('CreatePayment'));
+    const traceparent = '00-1234567890abcdef1234567890abcdef-3333333333333333-01';
+    jest.spyOn(tracer, 'scope').mockReturnValue({ active: () => ({ context: () => ({}) }) } as never);
+    jest.spyOn(tracer, 'inject').mockImplementation((_span, format, carrier) => { if (format === 'http_headers') (carrier as Record<string,string>).traceparent = traceparent; });
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    provider.getPayment.mockResolvedValue({ id: 'payment-test', status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50 });
+    await service.webhook('payment-test');
+    expect(store.events.find(event => event.type === 'PaymentConfirmed')).toMatchObject({ traceparent, sagaId: context.sagaId });
+    const record = JSON.parse(log.mock.calls[0][0] as string);
+    expect(record).toMatchObject({ event: 'billing.payment.checked', source: 'webhook', os_id: 'os-1', saga_id: context.sagaId, payment_id: 'payment-test' });
+    for (const key of ['payload', 'headers', 'signature', 'authorization']) expect(record).not.toHaveProperty(key);
   });
   it('recovers test payment approval after rejection when the second webhook is lost', async () => {
     await approved(); await service.command(message('CreatePayment'));
