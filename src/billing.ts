@@ -11,7 +11,16 @@ export class BillingService {
     if (!input || !['osId', 'filialId', 'clienteId'].every(key => typeof (input as Record<string, unknown>)[key] === 'string' && String((input as Record<string, unknown>)[key]).length > 0)) throw new BadRequestException('Identificadores obrigatorios');
     return this.store.create({ osId: input.osId, filialId: input.filialId, clienteId: input.clienteId, ...(input.mecanicoId ? { mecanicoId: input.mecanicoId } : {}), status: 'AWAITING_BUDGET' });
   }
-  async get(osId: string, claims?: Claims): Promise<Order> { const order = await this.store.get(osId); if (claims) authorize(order, claims, 'read'); return order; }
+  async get(osId: string, claims?: Claims): Promise<Order> {
+    const order = await this.store.get(osId);
+    if (claims) authorize(order, claims, 'read');
+    if (claims && ((claims.role ?? claims.papel) === 'CLIENTE' || claims.token_use === 'client') && order.budget) {
+      const safe = structuredClone(order);
+      delete safe.budget!.notasInternas;
+      return safe;
+    }
+    return order;
+  }
   async budget(osId: string, items: unknown, claims: Claims, ctx: Context): Promise<Order> {
     await this.store.change(osId, ctx, ({ order, emit }) => {
       authorize(order, claims, 'budget');
@@ -19,7 +28,7 @@ export class BillingService {
       order.budget = makeBudget(items, order.budget); order.status = 'AWAITING_APPROVAL';
       emit('BudgetGenerated', { budget: order.budget });
     });
-    return this.store.get(osId);
+    return this.get(osId, claims);
   }
   async decision(osId: string, approved: boolean, claims: Claims, ctx: Context): Promise<Order> {
     await this.store.change(osId, ctx, ({ order, emit }) => {
@@ -30,7 +39,7 @@ export class BillingService {
       order.budget.approved = approved; order.status = approved ? 'APPROVED' : 'REJECTED';
       emit(approved ? 'BudgetApproved' : 'BudgetRejected', { budget: order.budget });
     });
-    return this.store.get(osId);
+    return this.get(osId, claims);
   }
   async command(input: unknown): Promise<void> {
     validateEnvelope(input); const msg = input;
@@ -84,7 +93,7 @@ export class BillingService {
       try { const preference = await this.provider.create(create.order, create.payment); await this.savePreference(osId, paymentContext, preference); }
       catch { await this.store.change(osId, paymentContext, ({ order, emit }) => { if (order.payment!.status === 'CREATING') order.payment!.status = 'UNKNOWN'; emit('PaymentPending', { reason: 'PROVIDER_RESULT_UNKNOWN', amountCents: order.payment!.amountCents }); }); }
     }
-    return this.store.get(osId);
+    return this.get(osId, claims);
   }
   private async savePreference(osId: string, ctx: Context, preference: Preference): Promise<void> {
     const url = preference.init_point;

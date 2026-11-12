@@ -51,6 +51,22 @@ describe('HTTP boundary integration', () => {
     const spy = jest.spyOn(billing, 'webhook').mockResolvedValue();
     await request(app.getHttpServer()).post('/api/v1/billing/webhooks/mercadopago?data.id=123').set('x-request-id', 'req').set('x-signature', `ts=${stamp},v1=${sig}`).expect(201); expect(spy).toHaveBeenCalledWith('123');
   });
+  it('round-trips grouped budgets over HTTP and never sends internal notes to customer reads or decisions', async () => {
+    await billing.create(orderInput);
+    const groups = [{ title: 'Peças e reparo', items }];
+    const mechanic = `Bearer ${jwt('mechanic-1', 'MECANICO')}`;
+    const customer = `Bearer ${jwt('client-1', 'CLIENTE')}`;
+    const saved = await request(app.getHttpServer()).put('/api/v1/billing/orders/os-1/budget').set('Authorization', mechanic)
+      .send({ items, groups, notasCliente: 'Nota pública', notasInternas: 'Nota privada' }).expect(200);
+    expect(saved.body.budget).toMatchObject({ groups, notasCliente: 'Nota pública', notasInternas: 'Nota privada' });
+    const read = await request(app.getHttpServer()).get('/api/v1/billing/orders/os-1').set('Authorization', customer).expect(200);
+    expect(read.body.budget.groups).toEqual(groups);
+    expect(read.body.budget).not.toHaveProperty('notasInternas');
+    const decision = await request(app.getHttpServer()).post('/api/v1/billing/orders/os-1/approve').set('Authorization', customer).expect(201);
+    expect(decision.body.budget).not.toHaveProperty('notasInternas');
+    const internal = await request(app.getHttpServer()).get('/api/v1/billing/internal/orders/os-1').set('X-Internal-Token', 'internal').expect(200);
+    expect(internal.body.budget.notasInternas).toBe('Nota privada');
+  });
   it('persists W3C context in the generated event for browser requests without headers', async () => {
     await billing.create(orderInput);
     await request(app.getHttpServer()).put('/api/v1/billing/orders/os-1/budget')

@@ -3,8 +3,9 @@ export interface Envelope {
   filialId: string; correlationId: string; occurredAt: string; traceparent?: string;
   payload: Record<string, unknown>;
 }
-export interface BudgetItem { description: string; quantity: number; unitPriceCents: number; pecaId?: string }
-export interface Budget { items: BudgetItem[]; totalCents: number; version: number; approved: boolean; frozen: boolean }
+export interface BudgetItem { description: string; quantity: number; unitPriceCents: number; pecaId?: string; codigo?: string; nome?: string; filialId?: string }
+export interface BudgetGroup { title: string; items: BudgetItem[] }
+export interface Budget { items: BudgetItem[]; groups?: BudgetGroup[]; notasCliente?: string; notasInternas?: string; totalCents: number; version: number; approved: boolean; frozen: boolean }
 export interface Payment {
   status: 'CREATING' | 'UNKNOWN' | 'PENDING' | 'APPROVED' | 'REJECTED';
   key: string; externalReference: string; preferenceId?: string; checkoutUrl?: string;

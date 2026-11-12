@@ -9,6 +9,21 @@ describe('Billing business behavior', () => {
   beforeEach(async () => { jest.resetAllMocks(); store = new MemoryStore(); service = new BillingService(store, provider); provider.create.mockResolvedValue(preference); provider.findPayments.mockResolvedValue([]); await service.create(orderInput); });
   afterEach(() => jest.restoreAllMocks());
   async function approved() { await service.budget('os-1', items, mechanic, context); await service.decision('os-1', true, client, context); }
+  it('keeps internal notes durable and private across read, approval and checkout responses', async () => {
+    const groups = [{ title: 'Peças', items }];
+    await service.budget('os-1', { items, groups, notasCliente: 'Visível', notasInternas: 'Restrita' }, mechanic, context);
+    const customer = await service.get('os-1', client);
+    expect(customer.budget).toMatchObject({ groups, notasCliente: 'Visível' });
+    expect(customer.budget).not.toHaveProperty('notasInternas');
+    expect((await service.get('os-1', { sub: 'client-1', token_use: 'client' })).budget).not.toHaveProperty('notasInternas');
+    expect((await service.decision('os-1', true, client, context)).budget).not.toHaveProperty('notasInternas');
+    await service.command(message('PrepareApprovedBudget'));
+    expect(store.events.find(event => event.type === 'BudgetPrepared')?.payload?.budget).toMatchObject({ groups, notasInternas: 'Restrita' });
+    await service.command(message('CreatePayment'));
+    expect((await service.checkout('os-1', context, client)).budget).not.toHaveProperty('notasInternas');
+    expect((await service.get('os-1', mechanic)).budget?.notasInternas).toBe('Restrita');
+    expect((await service.get('os-1')).budget?.notasInternas).toBe('Restrita');
+  });
   it('generates versioned budgets, client approval and idempotent repeated decision', async () => {
     await service.budget('os-1', items, mechanic, context); await service.budget('os-1', items, admin, context);
     expect((await service.get('os-1', client)).budget).toMatchObject({ totalCents: 5000, version: 2, approved: false });
