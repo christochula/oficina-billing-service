@@ -1,5 +1,6 @@
 {
   "name": "oficina-billing-service", "version": "4.0.0", "private": true,
+  "license": "MIT",
   "description": "Orcamentos e pagamentos independentes da Oficina",
   "engines": { "node": ">=22" },
   "scripts": { "build": "tsc -p tsconfig.json", "start": "node --require dd-trace/init dist/main.js", "start:dev": "ts-node src/main.ts", "lint": "tsc --noEmit", "test": "jest --runInBand", "test:cov": "jest --runInBand --coverage", "test:integration": "jest --runInBand --config jest.integration.cjs", "migrate": "node dist/migrate.js" },

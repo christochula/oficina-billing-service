@@ -1,12 +1,29 @@
 import { BillingService } from '../src/billing';
 import { MemoryStore, orderInput, client, mechanic, context, items, message, admin } from './helpers';
+import tracer from 'dd-trace';
 
 describe('Billing business behavior', () => {
   let store: MemoryStore; let service: BillingService;
   const preference = { id: 'pref-1', init_point: 'https://pay.example/1', sandbox_init_point: 'https://sandbox.example/1' };
   const provider = { create: jest.fn(), findPreference: jest.fn(), findPayments: jest.fn(), getPayment: jest.fn() };
   beforeEach(async () => { jest.resetAllMocks(); store = new MemoryStore(); service = new BillingService(store, provider); provider.create.mockResolvedValue(preference); provider.findPayments.mockResolvedValue([]); await service.create(orderInput); });
+  afterEach(() => jest.restoreAllMocks());
   async function approved() { await service.budget('os-1', items, mechanic, context); await service.decision('os-1', true, client, context); }
+  it('keeps internal notes durable and private across read, approval and checkout responses', async () => {
+    const groups = [{ title: 'Peças', items }];
+    await service.budget('os-1', { items, groups, notasCliente: 'Visível', notasInternas: 'Restrita' }, mechanic, context);
+    const customer = await service.get('os-1', client);
+    expect(customer.budget).toMatchObject({ groups, notasCliente: 'Visível' });
+    expect(customer.budget).not.toHaveProperty('notasInternas');
+    expect((await service.get('os-1', { sub: 'client-1', token_use: 'client' })).budget).not.toHaveProperty('notasInternas');
+    expect((await service.decision('os-1', true, client, context)).budget).not.toHaveProperty('notasInternas');
+    await service.command(message('PrepareApprovedBudget'));
+    expect(store.events.find(event => event.type === 'BudgetPrepared')?.payload?.budget).toMatchObject({ groups, notasInternas: 'Restrita' });
+    await service.command(message('CreatePayment'));
+    expect((await service.checkout('os-1', context, client)).budget).not.toHaveProperty('notasInternas');
+    expect((await service.get('os-1', mechanic)).budget?.notasInternas).toBe('Restrita');
+    expect((await service.get('os-1')).budget?.notasInternas).toBe('Restrita');
+  });
   it('generates versioned budgets, client approval and idempotent repeated decision', async () => {
     await service.budget('os-1', items, mechanic, context); await service.budget('os-1', items, admin, context);
     expect((await service.get('os-1', client)).budget).toMatchObject({ totalCents: 5000, version: 2, approved: false });
@@ -58,7 +75,7 @@ describe('Billing business behavior', () => {
     await approved(); await expect(service.checkout('os-1', context, client)).rejects.toThrow('apos reparo');
     const command = message('CreatePayment'); await service.command(command); await service.command(command);
     const result = await service.checkout('os-1', context, client);
-    expect(result.payment).toMatchObject({ status: 'PENDING', checkoutUrl: preference.sandbox_init_point, amountCents: 5000 });
+    expect(result.payment).toMatchObject({ status: 'PENDING', checkoutUrl: preference.init_point, amountCents: 5000 });
     expect(provider.create).toHaveBeenCalledTimes(1);
     await service.command(message('ReleaseBudgetPreparation')); expect(store.events.at(-1)?.type).toBe('CommandFailed');
   });
@@ -101,10 +118,42 @@ describe('Billing business behavior', () => {
     provider.getPayment.mockResolvedValue({ ...payment, status: 'rejected' }); await service.webhook('123'); expect((await service.get('os-1')).payment?.status).toBe('REJECTED');
     expect((await service.get('os-1')).repairCompleted).toBe(true);
   });
-  it('reconciles approved payment without webhook and selects production checkout', async () => {
-    service = new BillingService(store, provider, false); await approved(); await service.command(message('CreatePayment'));
+  it('reconciles approved payment without webhook and always uses Checkout Pro init_point', async () => {
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    await approved(); await service.command(message('CreatePayment'));
     expect((await service.get('os-1')).payment?.checkoutUrl).toBe(preference.init_point);
     provider.findPayments.mockResolvedValue([{ id: 'p', status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50 }]);
     await service.reconcile(); expect((await service.get('os-1')).status).toBe('PAID');
+    expect(JSON.parse(log.mock.calls.at(-1)![0] as string)).toMatchObject({ event: 'billing.payment.checked', source: 'reconciliation', os_id: 'os-1', saga_id: context.sagaId });
+  });
+  it('persists the verified webhook span in PaymentConfirmed and records only safe provenance', async () => {
+    await approved(); await service.command(message('CreatePayment'));
+    const traceparent = '00-1234567890abcdef1234567890abcdef-3333333333333333-01';
+    jest.spyOn(tracer, 'scope').mockReturnValue({ active: () => ({ context: () => ({}) }) } as never);
+    jest.spyOn(tracer, 'inject').mockImplementation((_span, format, carrier) => { if (format === 'http_headers') (carrier as Record<string,string>).traceparent = traceparent; });
+    const log = jest.spyOn(console, 'log').mockImplementation(() => {});
+    provider.getPayment.mockResolvedValue({ id: 'payment-test', status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50 });
+    await service.webhook('payment-test');
+    expect(store.events.find(event => event.type === 'PaymentConfirmed')).toMatchObject({ traceparent, sagaId: context.sagaId });
+    const record = JSON.parse(log.mock.calls[0][0] as string);
+    expect(record).toMatchObject({ event: 'billing.payment.checked', source: 'webhook', os_id: 'os-1', saga_id: context.sagaId, payment_id: 'payment-test' });
+    for (const key of ['payload', 'headers', 'signature', 'authorization']) expect(record).not.toHaveProperty(key);
+  });
+  it('recovers test payment approval after rejection when the second webhook is lost', async () => {
+    await approved(); await service.command(message('CreatePayment'));
+    provider.getPayment.mockResolvedValue({ id: 'rejected-attempt', status: 'rejected', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50, live_mode: false });
+    await service.webhook('rejected-attempt');
+    expect((await service.get('os-1')).payment?.status).toBe('REJECTED');
+    expect((await service.get('os-1')).status).toBe('AWAITING_PAYMENT');
+    provider.findPayments.mockResolvedValue([
+      { id: 'approved-attempt', status: 'approved', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50, live_mode: false },
+      { id: 'rejected-attempt', status: 'rejected', external_reference: 'os-1:1', currency_id: 'BRL', transaction_amount: 50, live_mode: false },
+    ]);
+    await service.reconcile(); await service.reconcile();
+    expect((await service.get('os-1')).status).toBe('PAID');
+    expect((await service.get('os-1')).payment?.paymentId).toBe('approved-attempt');
+    expect(store.events.filter(event => event.type === 'PaymentConfirmed')).toHaveLength(1);
+    expect(store.events.at(-1)?.sagaId).toBe(context.sagaId);
+    expect(provider.create).toHaveBeenCalledTimes(1);
   });
 });

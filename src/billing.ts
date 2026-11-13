@@ -3,14 +3,24 @@ import { randomUUID } from 'node:crypto';
 import { authorize, makeBudget, requireApproved, validateEnvelope } from './domain';
 import { PaymentProvider, Preference, ProviderPayment } from './mercadopago';
 import { BillingStore, Claims, Context, Envelope, Order, Payment } from './types';
+import { captureTraceparent, withTraceIds } from './trace-context';
 
 export class BillingService {
-  constructor(readonly store: BillingStore, readonly provider: PaymentProvider, readonly sandbox = true) {}
+  constructor(readonly store: BillingStore, readonly provider: PaymentProvider) {}
   async create(input: { osId: string; filialId: string; clienteId: string; mecanicoId?: string }): Promise<Order> {
     if (!input || !['osId', 'filialId', 'clienteId'].every(key => typeof (input as Record<string, unknown>)[key] === 'string' && String((input as Record<string, unknown>)[key]).length > 0)) throw new BadRequestException('Identificadores obrigatorios');
     return this.store.create({ osId: input.osId, filialId: input.filialId, clienteId: input.clienteId, ...(input.mecanicoId ? { mecanicoId: input.mecanicoId } : {}), status: 'AWAITING_BUDGET' });
   }
-  async get(osId: string, claims?: Claims): Promise<Order> { const order = await this.store.get(osId); if (claims) authorize(order, claims, 'read'); return order; }
+  async get(osId: string, claims?: Claims): Promise<Order> {
+    const order = await this.store.get(osId);
+    if (claims) authorize(order, claims, 'read');
+    if (claims && ((claims.role ?? claims.papel) === 'CLIENTE' || claims.token_use === 'client') && order.budget) {
+      const safe = structuredClone(order);
+      delete safe.budget!.notasInternas;
+      return safe;
+    }
+    return order;
+  }
   async budget(osId: string, items: unknown, claims: Claims, ctx: Context): Promise<Order> {
     await this.store.change(osId, ctx, ({ order, emit }) => {
       authorize(order, claims, 'budget');
@@ -18,7 +28,7 @@ export class BillingService {
       order.budget = makeBudget(items, order.budget); order.status = 'AWAITING_APPROVAL';
       emit('BudgetGenerated', { budget: order.budget });
     });
-    return this.store.get(osId);
+    return this.get(osId, claims);
   }
   async decision(osId: string, approved: boolean, claims: Claims, ctx: Context): Promise<Order> {
     await this.store.change(osId, ctx, ({ order, emit }) => {
@@ -29,7 +39,7 @@ export class BillingService {
       order.budget.approved = approved; order.status = approved ? 'APPROVED' : 'REJECTED';
       emit(approved ? 'BudgetApproved' : 'BudgetRejected', { budget: order.budget });
     });
-    return this.store.get(osId);
+    return this.get(osId, claims);
   }
   async command(input: unknown): Promise<void> {
     validateEnvelope(input); const msg = input;
@@ -83,10 +93,10 @@ export class BillingService {
       try { const preference = await this.provider.create(create.order, create.payment); await this.savePreference(osId, paymentContext, preference); }
       catch { await this.store.change(osId, paymentContext, ({ order, emit }) => { if (order.payment!.status === 'CREATING') order.payment!.status = 'UNKNOWN'; emit('PaymentPending', { reason: 'PROVIDER_RESULT_UNKNOWN', amountCents: order.payment!.amountCents }); }); }
     }
-    return this.store.get(osId);
+    return this.get(osId, claims);
   }
   private async savePreference(osId: string, ctx: Context, preference: Preference): Promise<void> {
-    const url = this.sandbox ? preference.sandbox_init_point ?? preference.init_point : preference.init_point;
+    const url = preference.init_point;
     if (!preference.id || (!url?.startsWith('https://') && !(['test', 'development'].includes(process.env.NODE_ENV ?? '') && /^http:\/\/(localhost|127\.0\.0\.1|mercadopago|mercadopago-stub)(:\d+)?\//.test(url ?? '')))) throw new Error('Preferencia invalida');
     await this.store.change(osId, ctx, ({ order, emit }) => {
       order.payment!.preferenceId = preference.id; order.payment!.checkoutUrl = url;
@@ -94,13 +104,14 @@ export class BillingService {
       emit('PaymentCreated', { checkoutUrl: url, preferenceId: preference.id });
     });
   }
-  async webhook(paymentId: string): Promise<void> { await this.acceptPayment(await this.provider.getPayment(paymentId)); }
-  private async acceptPayment(payment: ProviderPayment): Promise<void> {
+  async webhook(paymentId: string): Promise<void> { await this.acceptPayment(await this.provider.getPayment(paymentId), 'webhook'); }
+  private async acceptPayment(payment: ProviderPayment, source: 'webhook' | 'reconciliation'): Promise<void> {
     if (typeof payment.external_reference !== 'string') throw new BadRequestException('Referencia ausente');
     const separator = payment.external_reference.lastIndexOf(':');
     const osId = payment.external_reference.slice(0, separator);
     const snapshot = await this.store.get(osId);
-    const ctx: Context = { sagaId: snapshot.payment?.sagaId ?? osId, correlationId: snapshot.payment?.correlationId ?? `mp-${payment.id}`, ...(snapshot.payment?.traceparent ? { traceparent: snapshot.payment.traceparent } : {}) };
+    const traceparent = captureTraceparent(snapshot.payment?.traceparent);
+    const ctx: Context = { sagaId: snapshot.payment?.sagaId ?? osId, correlationId: snapshot.payment?.correlationId ?? `mp-${payment.id}`, ...(traceparent ? { traceparent } : {}) };
     await this.store.change(osId, ctx, ({ order, emit }) => {
       if (!order.payment || order.payment.externalReference !== payment.external_reference || payment.currency_id !== 'BRL' || !Number.isFinite(payment.transaction_amount) || Math.round(payment.transaction_amount * 100) !== order.payment.amountCents) throw new BadRequestException('Pagamento nao corresponde a OS/valor/moeda');
       if (order.payment.status === 'APPROVED') return;
@@ -112,16 +123,18 @@ export class BillingService {
         emit('PaymentPending', { providerStatus: payment.status, amountCents: order.payment.amountCents });
       }
     }, `mp:${payment.id}:${payment.status}`);
+    try { console.log(JSON.stringify(withTraceIds({ event: 'billing.payment.checked', source, os_id: osId, saga_id: ctx.sagaId, correlation_id: ctx.correlationId, payment_id: String(payment.id), providerApproved: payment.status === 'approved' }))); }
+    catch { /* Telemetry must not fail an already committed payment update. */ }
   }
   async reconcile(): Promise<void> {
     for (const order of await this.store.pendingPayments()) {
       try {
-        const ctx = { sagaId: order.osId, correlationId: `reconcile-${order.osId}` };
+        const ctx: Context = { sagaId: order.payment!.sagaId ?? order.paymentContext?.sagaId ?? order.osId, correlationId: order.payment!.correlationId ?? `reconcile-${order.osId}`, ...(order.payment!.traceparent ? { traceparent: order.payment!.traceparent } : {}) };
         if (!order.payment!.preferenceId) {
           const preference = await this.provider.findPreference(order.payment!.externalReference);
           if (preference) await this.savePreference(order.osId, ctx, preference);
         }
-        for (const payment of await this.provider.findPayments(order.payment!.externalReference)) await this.acceptPayment(payment);
+        for (const payment of await this.provider.findPayments(order.payment!.externalReference)) await this.acceptPayment(payment, 'reconciliation');
       } catch { /* Unknown outcomes remain durable for the next reconciliation; never repeat POST. */ }
     }
   }

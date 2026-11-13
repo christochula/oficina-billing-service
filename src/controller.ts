@@ -6,10 +6,12 @@ import { BillingService } from './billing';
 import { internalToken, JwtGuard } from './auth';
 import { verifyWebhook } from './mercadopago';
 import { Claims, Context } from './types';
+import { captureTraceparent } from './trace-context';
 
 type AuthRequest = Request & { claims: Claims };
 function context(req: Request, osId: string): Context {
-  return { sagaId: osId, correlationId: String(req.headers['x-correlation-id'] ?? randomUUID()), ...(req.headers.traceparent ? { traceparent: String(req.headers.traceparent) } : {}) };
+  const traceparent = captureTraceparent(typeof req.headers.traceparent === 'string' ? req.headers.traceparent : undefined);
+  return { sagaId: osId, correlationId: String(req.headers['x-correlation-id'] ?? randomUUID()), ...(traceparent ? { traceparent } : {}) };
 }
 @ApiTags('Billing')
 @ApiBearerAuth()
@@ -22,7 +24,7 @@ export class BillingController {
   get(@Param('osId') id: string, @Req() req: AuthRequest) { return this.billing.get(id, req.claims); }
   @Put(':osId/budget')
   @ApiBody({ schema: { example: { items: [{ description: 'Reparo', quantity: 1, unitPriceCents: 10000 }] } } })
-  budget(@Param('osId') id: string, @Body() body: { items: unknown }, @Req() req: AuthRequest) { return this.billing.budget(id, body?.items, req.claims, context(req, id)); }
+  budget(@Param('osId') id: string, @Body() body: { items: unknown; groups?: unknown; notasCliente?: string; notasInternas?: string }, @Req() req: AuthRequest) { return this.billing.budget(id, body, req.claims, context(req, id)); }
   @Post(':osId/approve')
   approve(@Param('osId') id: string, @Req() req: AuthRequest) { return this.billing.decision(id, true, req.claims, context(req, id)); }
   @Post(':osId/reject')

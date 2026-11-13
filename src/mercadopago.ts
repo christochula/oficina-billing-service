@@ -2,7 +2,7 @@ import { UnauthorizedException } from '@nestjs/common';
 import { createHmac, timingSafeEqual } from 'node:crypto';
 import { Order, Payment } from './types';
 
-export interface Preference { id: string; init_point: string; sandbox_init_point?: string }
+export interface Preference { id: string; init_point: string }
 export interface ProviderPayment { id: string | number; status: string; external_reference: string; transaction_amount: number; currency_id: string; collector_id?: number }
 export interface PaymentProvider {
   create(order: Order, payment: Payment): Promise<Preference>;
@@ -13,6 +13,14 @@ export interface PaymentProvider {
 
 export class MercadoPago implements PaymentProvider {
   constructor(private readonly env: NodeJS.ProcessEnv = process.env, private readonly http: typeof fetch = fetch) {}
+  private configuredUrl(value: string, name: string, localHosts: string[]): URL {
+    let url: URL;
+    try { url = new URL(value); } catch { throw new Error(`${name} invalida`); }
+    const local = ['localhost', '127.0.0.1', '0.0.0.0', '[::1]', 'billing', 'mercadopago', 'mercadopago-stub'].includes(url.hostname) || url.hostname.endsWith('.localhost');
+    const allowedDevelopmentHttp = ['test', 'development'].includes(this.env.NODE_ENV ?? '') && url.protocol === 'http:' && localHosts.includes(url.hostname);
+    if (url.username || url.password || (url.protocol !== 'https:' || local) && !allowedDevelopmentHttp) throw new Error(`${name} deve ser HTTPS publica; HTTP local somente em desenvolvimento/testes`);
+    return url;
+  }
   private async request<T>(path: string, init: RequestInit = {}): Promise<T> {
     if (!this.env.MP_ACCESS_TOKEN) throw new Error('MP_ACCESS_TOKEN nao configurado');
     const base = this.env.MP_API_BASE_URL ?? 'https://api.mercadopago.com';
@@ -23,11 +31,15 @@ export class MercadoPago implements PaymentProvider {
   }
   async create(order: Order, payment: Payment): Promise<Preference> {
     if (!this.env.MP_NOTIFICATION_URL || !this.env.MP_BACK_URL) throw new Error('URLs Mercado Pago nao configuradas');
+    const notification = this.configuredUrl(this.env.MP_NOTIFICATION_URL, 'MP_NOTIFICATION_URL', ['billing', 'localhost', '127.0.0.1']);
+    const back = this.configuredUrl(this.env.MP_BACK_URL, 'MP_BACK_URL', ['localhost', '127.0.0.1']);
+    back.hash = `/ordens/${encodeURIComponent(order.osId)}`;
     return this.request('/checkout/preferences', { method: 'POST', headers: { 'X-Idempotency-Key': payment.key }, body: JSON.stringify({
       external_reference: payment.externalReference,
       items: [{ id: order.osId, title: `Reparo OS ${order.osId}`, quantity: 1, currency_id: 'BRL', unit_price: payment.amountCents / 100 }],
-      notification_url: this.env.MP_NOTIFICATION_URL,
-      back_urls: { success: this.env.MP_BACK_URL, pending: this.env.MP_BACK_URL, failure: this.env.MP_BACK_URL },
+      notification_url: notification.toString(),
+      back_urls: { success: back.toString(), pending: back.toString(), failure: back.toString() },
+      ...(back.protocol === 'https:' ? { auto_return: 'approved' } : {}),
       metadata: { os_id: order.osId, filial_id: order.filialId, budget_version: order.budget!.version },
     }) });
   }
